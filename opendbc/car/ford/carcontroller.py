@@ -143,14 +143,7 @@ class CarController(CarControllerBase):
 
     # send lka msg at 33Hz (ford-lka: populated with angle command)
     if (self.frame % CarControllerParams.LKA_STEP) == 0:
-      # Track camera LKA availability; avoid sending near timeout boundary
-      if not CS.lkas_available:
-        self.last_timeout_duration = time.time() - self.last_timeout_at
-        self.last_timeout_at = time.time()
-
-      near_timeout = (time.time() - self.last_timeout_at) >= (self.last_timeout_duration - 0.5)
-
-      lka_active = CC.latActive and CS.lkas_available and not near_timeout
+      lka_active = CC.latActive and CS.lkas_available
 
       if lka_active:
         direction = 4 if apply_angle > 0.1 else (2 if apply_angle < -0.1 else 0)
