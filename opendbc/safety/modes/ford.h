@@ -344,17 +344,25 @@ static safety_config ford_init(uint16_t param) {
 }
 
 static bool ford_fwd_hook(int bus_num, int addr) {
-  // ford-lka: only block stock camera→PSCM lateral messages when openpilot is ENGAGED
-  // (controls_allowed). When disengaged, let stock LKA/LCA/ACCDATA pass through so the
-  // IPMA camera doesn't fault at idle.
-  if (controls_allowed && bus_num == FORD_CAM_BUS) {
-    if (addr == FORD_Lane_Assist_Data1 ||
-        addr == FORD_LateralMotionControl ||
-        addr == FORD_LateralMotionControl2 ||
-        addr == FORD_ACCDATA ||
-        addr == FORD_ACCDATA_3 ||
-        addr == FORD_IPMA_Data) {
-      return true;  // block
+  // ford-lka: ACCDATA/ACCDATA_3 are always blocked — pandad emits these at 50Hz whenever
+  // openpilotLongitudinalControl=True, independent of engagement. If we let stock IPMA's
+  // copies through after disengagement, the PCM sees two senders on the same msg ID per
+  // 20ms window with conflicting bits, flapping EngBrakeData.CcStat_D_Actl between valid
+  // (3/4/5) and faulted (1/2) at ~25Hz. That is the "Cruise Fault: Restart the car to
+  // engage" condition observed in route 074a9a28f2 (136s fault start, 1600 toggles, 18%
+  // faulted-time; also seen in 259ad29d69 at 109s post-disengage).
+  //
+  // Lateral (LKA/LMC/IPMA_Data) stays engagement-gated so stock lane-keep-alerts remain
+  // operational when openpilot is off.
+  if (bus_num == FORD_CAM_BUS) {
+    if (addr == FORD_ACCDATA || addr == FORD_ACCDATA_3) {
+      return true;  // always block — pandad owns ACC
+    }
+    if (controls_allowed && (addr == FORD_Lane_Assist_Data1 ||
+                             addr == FORD_LateralMotionControl ||
+                             addr == FORD_LateralMotionControl2 ||
+                             addr == FORD_IPMA_Data)) {
+      return true;  // block while engaged
     }
   }
   return false;  // allow

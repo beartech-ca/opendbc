@@ -146,9 +146,15 @@ class CarController(CarControllerBase):
       lka_active = CC.latActive and CS.lkas_available
 
       if lka_active:
-        # mims002 pattern: direction based on CURRENT wheel angle (self-centering logic)
-        # wheel turned right (>0) → push left (2); turned left (<=0) → push right (4)
-        direction = 2 if CS.out.steeringAngleDeg > 0 else 4
+        # direction follows commanded delta sign (LkaActvStats_D2_Req: 2=left, 4=right).
+        # Mismatched direction vs angle sign causes PSCM to reject or nudge wrong way.
+        # Deadband ±0.1° keeps direction=0 when centered instead of biasing one way.
+        if apply_angle > 0.1:
+          direction = 4
+        elif apply_angle < -0.1:
+          direction = 2
+        else:
+          direction = 0
         ramp_type = 1 if abs(apply_angle) >= 5.0 else 0
       else:
         direction = 0
