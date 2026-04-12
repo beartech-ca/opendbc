@@ -224,7 +224,14 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
   }
 
   // ford-lka: Lane_Assist_Data1 with non-zero action (LkaActvStats_D2_Req) is EXPECTED —
-  // this is how we command steering via the LKA channel. No action check.
+  // we command steering via LKA channel. Allow 0 (disabled), 2 (left), 4 (right).
+  // Reject other values (e.g. 1/3/5/6/7 are not valid LKA directions per stock).
+  if (msg->addr == FORD_Lane_Assist_Data1) {
+    unsigned int action = msg->data[0] >> 5;
+    if (action != 0U && action != 2U && action != 4U) {
+      tx = false;
+    }
+  }
 
   // ford-lka: LateralMotionControl is passthrough-only (we replay camera values
   // with LatCtl_D_Rq=0 to keep PSCM↔camera heartbeat alive). LKA channel handles

@@ -146,7 +146,9 @@ class CarController(CarControllerBase):
       lka_active = CC.latActive and CS.lkas_available
 
       if lka_active:
-        direction = 4 if apply_angle > 0.1 else (2 if apply_angle < -0.1 else 0)
+        # mims002 pattern: direction based on CURRENT wheel angle (self-centering logic)
+        # wheel turned right (>0) → push left (2); turned left (<=0) → push right (4)
+        direction = 2 if CS.out.steeringAngleDeg > 0 else 4
         ramp_type = 1 if abs(apply_angle) >= 5.0 else 0
       else:
         direction = 0
