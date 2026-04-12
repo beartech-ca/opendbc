@@ -225,4 +225,19 @@ FW_VERSIONS = {
       b'RJ6T-14H102-BBB\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     ],
   },
+  # ford-lka: captured from 2025 Ford Transit (VIN 1FTBF8XG0SKA96907)
+  CAR.FORD_TRANSIT_MK5: {
+    (Ecu.eps, 0x730, None): [
+      b'KK21-14D003-AM\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.abs, 0x760, None): [
+      b'NK41-2D053-DF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.fwdRadar, 0x764, None): [
+      b'PC4T-14D049-AA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.fwdCamera, 0x706, None): [
+      b'NK3T-14F397-AB\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+  },
 }

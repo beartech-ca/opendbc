@@ -223,17 +223,8 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     }
   }
 
-  // Safety check for Lane_Assist_Data1 action
-  if (msg->addr == FORD_Lane_Assist_Data1) {
-    // Do not allow steering using Lane_Assist_Data1 (Lane-Departure Aid).
-    // This message must be sent for Lane Centering to work, and can include
-    // values such as the steering angle or lane curvature for debugging,
-    // but the action (LkaActvStats_D2_Req) must be set to zero.
-    unsigned int action = msg->data[0] >> 5;
-    if (action != 0U) {
-      tx = false;
-    }
-  }
+  // ford-lka: Lane_Assist_Data1 with non-zero action (LkaActvStats_D2_Req) is EXPECTED —
+  // this is how we command steering via the LKA channel. No action check.
 
   // Safety check for LateralMotionControl action
   if (msg->addr == FORD_LateralMotionControl) {
@@ -345,10 +336,28 @@ static safety_config ford_init(uint16_t param) {
   return ret;
 }
 
+static bool ford_fwd_hook(int bus_num, int addr) {
+  // ford-lka: only block stock camera→PSCM lateral messages when openpilot is ENGAGED
+  // (controls_allowed). When disengaged, let stock LKA/LCA/ACCDATA pass through so the
+  // IPMA camera doesn't fault at idle.
+  if (controls_allowed && bus_num == FORD_CAM_BUS) {
+    if (addr == FORD_Lane_Assist_Data1 ||
+        addr == FORD_LateralMotionControl ||
+        addr == FORD_LateralMotionControl2 ||
+        addr == FORD_ACCDATA ||
+        addr == FORD_ACCDATA_3 ||
+        addr == FORD_IPMA_Data) {
+      return true;  // block
+    }
+  }
+  return false;  // allow
+}
+
 const safety_hooks ford_hooks = {
   .init = ford_init,
   .rx = ford_rx_hook,
   .tx = ford_tx_hook,
+  .fwd = ford_fwd_hook,
   .get_counter = ford_get_counter,
   .get_checksum = ford_get_checksum,
   .compute_checksum = ford_compute_checksum,

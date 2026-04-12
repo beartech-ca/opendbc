@@ -66,19 +66,10 @@ class CarInterface(CarInterfaceBase):
           carlog.error('dashcamOnly: SecOC is unsupported')
           ret.dashcamOnly = True
     else:
-      # Lock out if the car does not have needed lateral and longitudinal control APIs.
-      # Note that we also check CAN for adaptive cruise, but no known signal for LCA exists
-      pscm_config = next((fw for fw in car_fw if fw.ecu == Ecu.eps and b'\x22\xDE\x01' in fw.request), None)
-      if pscm_config:
-        if len(pscm_config.fwVersion) != 24:
-          carlog.error('dashcamOnly: Invalid EPS FW version')
-          ret.dashcamOnly = True
-        else:
-          config_tja = pscm_config.fwVersion[7]  # Traffic Jam Assist
-          config_lca = pscm_config.fwVersion[8]  # Lane Centering Assist
-          if config_tja != 0xFF or config_lca != 0xFF:
-            carlog.error('dashcamOnly: Car lacks required lateral control APIs')
-            ret.dashcamOnly = True
+      # ford-lka: use LKA path (Lane_Assist_Data1) instead of TJA/LCA — skips the stock
+      # lockout check that requires PSCM FW to have TJA/LCA configured. LKA works with
+      # the default Transit PSCM firmware.
+      pass
 
     # Auto Transmission: 0x732 ECU or Gear_Shift_by_Wire_FD1
     found_ecus = [fw.ecu for fw in car_fw]

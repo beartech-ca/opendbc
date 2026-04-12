@@ -178,6 +178,11 @@ class CAR(Platforms):
     [FordCarDocs("Ford Ranger 2024", "Adaptive Cruise Control with Lane Centering", setup_video="https://www.youtube.com/watch?v=2oJlXCKYOy0")],
     CarSpecs(mass=2000, wheelbase=3.27, steerRatio=17.0),
   )
+  # ford-lka: 2025 Transit (VIN 1FTBF8XG0SKA96907) — CAN (Q3), LKA-only steering path
+  FORD_TRANSIT_MK5 = FordPlatformConfig(
+    [FordCarDocs("Ford Transit 2025", "Co-Pilot360 Assist+")],
+    CarSpecs(mass=2068, wheelbase=3.302, steerRatio=16.7),
+  )
 
 
 # FW response contains a combined software and part number

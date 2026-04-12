@@ -33,55 +33,85 @@ def calculate_lat_ctl2_checksum(mode: int, counter: int, dat: bytearray) -> int:
   return 0xFF - (checksum & 0xFF)
 
 
-def create_lka_msg(packer, CAN: CanBus):
+def create_lka_msg(packer, CAN: CanBus, active: bool = False, apply_angle: float = 0.0,
+                   direction: int = 0, ramp_type: int = 0):
   """
-  Creates an empty CAN message for the Ford LKA Command.
+  Creates a CAN message for the Ford LKA Command.
 
-  This command can apply "Lane Keeping Aid" maneuvers, which are subject to the PSCM lockout.
+  ford-lka: populated version that actually commands steering via the Lane Keep Assist
+  channel. Based on mims002's Bronco Sport LKA work. Angle is clipped to +/-5.8 degrees
+  and converted to milliradians.
+
+  direction: 0=none, 2=left, 4=right (needs on-vehicle confirmation per platform)
+  ramp_type: 0=slow, 1=fast
 
   Frequency is 33Hz.
   """
+  import math
+  MAX_ANGLE = 5.8
+  if active:
+    clipped = max(-MAX_ANGLE, min(MAX_ANGLE, apply_angle))
+    mrad = math.radians(clipped) * 1000.0  # deg -> mrad
+    mrad = max(-102.4, min(102.3, mrad))  # DBC range
+  else:
+    mrad = 0.0
+    direction = 0
+    ramp_type = 0
 
-  return packer.make_can_msg("Lane_Assist_Data1", CAN.main, {})
+  values = {
+    "LkaDrvOvrrd_D_Rq": 0,
+    "LkaActvStats_D2_Req": direction if active else 0,
+    "LaRefAng_No_Req": mrad,
+    "LaRampType_B_Req": ramp_type,
+    "LaCurvature_No_Calc": 0,
+    "LdwActvStats_D_Req": 0,
+    "LdwActvIntns_D_Req": 3 if active else 0,
+  }
+  return packer.make_can_msg("Lane_Assist_Data1", CAN.main, values)
 
 
 def create_lat_ctl_msg(packer, CAN: CanBus, lat_active: bool, path_offset: float, path_angle: float, curvature: float,
-                       curvature_rate: float):
+                       curvature_rate: float, stock_lmc=None):
   """
   Creates a CAN message for the Ford TJA/LCA Command.
 
+  ford-lka: supports stock_lmc passthrough. When provided, replay camera's LateralMotionControl
+  values (keeps PSCM↔camera heartbeat alive) while disabling activation via LatCtl_D_Rq=0.
+  Required in LKA mode to prevent IPMA camera fault.
+
   This command can apply "Lane Centering" maneuvers: continuous lane centering for traffic jam assist and highway
   driving. It is not subject to the PSCM lockout.
-
-  Ford lane centering command uses a third order polynomial to describe the road centerline. The polynomial is defined
-  by the following coefficients:
-    c0: lateral offset between the vehicle and the centerline (positive is right)
-    c1: heading angle between the vehicle and the centerline (positive is right)
-    c2: curvature of the centerline (positive is left)
-    c3: rate of change of curvature of the centerline
-  As the PSCM combines this information with other sensor data, such as the vehicle's yaw rate and speed, the steering
-  angle cannot be easily controlled.
 
   The PSCM should be configured to accept TJA/LCA commands before these commands will be processed. This can be done
   using tools such as Forscan.
 
   Frequency is 20Hz.
   """
-
-  values = {
-    "LatCtlRng_L_Max": 0,                       # Unknown [0|126] meter
-    "HandsOffCnfm_B_Rq": 0,                     # Unknown: 0=Inactive, 1=Active [0|1]
-    "LatCtl_D_Rq": 1 if lat_active else 0,      # Mode: 0=None, 1=ContinuousPathFollowing, 2=InterventionLeft,
-                                                #       3=InterventionRight, 4-7=NotUsed [0|7]
-    "LatCtlRampType_D_Rq": 0,                   # Ramp speed: 0=Slow, 1=Medium, 2=Fast, 3=Immediate [0|3]
-                                                #             Makes no difference with curvature control
-    "LatCtlPrecision_D_Rq": 1,                  # Precision: 0=Comfortable, 1=Precise, 2/3=NotUsed [0|3]
-                                                #            The stock system always uses comfortable
-    "LatCtlPathOffst_L_Actl": path_offset,      # Path offset [-5.12|5.11] meter
-    "LatCtlPath_An_Actl": path_angle,           # Path angle [-0.5|0.5235] radians
-    "LatCtlCurv_NoRate_Actl": curvature_rate,   # Curvature rate [-0.001024|0.00102375] 1/meter^2
-    "LatCtlCurv_No_Actl": curvature,            # Curvature [-0.02|0.02094] 1/meter
-  }
+  if stock_lmc is not None:
+    # passthrough mode: replay camera's values with activation disabled
+    values = {
+      "LatCtlRng_L_Max": stock_lmc["LatCtlRng_L_Max"],
+      "HandsOffCnfm_B_Rq": stock_lmc["HandsOffCnfm_B_Rq"],
+      "LatCtl_D_Rq": 0,  # always disabled in passthrough
+      "LatCtlRampType_D_Rq": stock_lmc["LatCtlRampType_D_Rq"],
+      "LatCtlPrecision_D_Rq": stock_lmc["LatCtlPrecision_D_Rq"],
+      "LatCtlPathOffst_L_Actl": stock_lmc["LatCtlPathOffst_L_Actl"],
+      "LatCtlPath_An_Actl": stock_lmc["LatCtlPath_An_Actl"],
+      "LatCtlCurv_NoRate_Actl": stock_lmc["LatCtlCurv_NoRate_Actl"],
+      "LatCtlCurv_No_Actl": stock_lmc["LatCtlCurv_No_Actl"],
+    }
+  else:
+    values = {
+      "LatCtlRng_L_Max": 0,
+      "HandsOffCnfm_B_Rq": 0,
+      "LatCtl_D_Rq": 1 if lat_active else 0,
+      "LatCtlRampType_D_Rq": 0,
+      "LatCtlPrecision_D_Rq": 1,
+      "LatCtlPathOffst_L_Actl": path_offset,
+      "LatCtlPath_An_Actl": path_angle,
+      "LatCtlCurv_NoRate_Actl": curvature_rate,
+      "LatCtlCurv_No_Actl": curvature,
+    }
   return packer.make_can_msg("LateralMotionControl", CAN.main, values)
 
 
