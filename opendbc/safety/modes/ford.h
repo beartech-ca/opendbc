@@ -226,25 +226,23 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
   // ford-lka: Lane_Assist_Data1 with non-zero action (LkaActvStats_D2_Req) is EXPECTED —
   // this is how we command steering via the LKA channel. No action check.
 
-  // Safety check for LateralMotionControl action
+  // ford-lka: LateralMotionControl is passthrough-only (we replay camera values
+  // with LatCtl_D_Rq=0 to keep PSCM↔camera heartbeat alive). LKA channel handles
+  // actual steering. If LatCtl_D_Rq=0, allow any path values.
   if (msg->addr == FORD_LateralMotionControl) {
-    // Signal: LatCtl_D_Rq
     bool steer_control_enabled = ((msg->data[4] >> 2) & 0x7U) != 0U;
-    unsigned int raw_curvature = (msg->data[0] << 3) | (msg->data[1] >> 5);
-    unsigned int raw_curvature_rate = ((msg->data[1] & 0x1FU) << 8) | msg->data[2];
-    unsigned int raw_path_angle = (msg->data[3] << 3) | (msg->data[4] >> 5);
-    unsigned int raw_path_offset = (msg->data[5] << 2) | (msg->data[6] >> 6);
-
-    // These signals are not yet tested with the current safety limits
-    bool violation = (raw_curvature_rate != FORD_INACTIVE_CURVATURE_RATE) || (raw_path_angle != FORD_INACTIVE_PATH_ANGLE) || (raw_path_offset != FORD_INACTIVE_PATH_OFFSET);
-
-    // Check angle error and steer_control_enabled
-    int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;  // /FORD_STEERING_LIMITS.angle_deg_to_can to get real curvature
-    violation |= steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_STEERING_LIMITS);
-
-    if (violation) {
-      tx = false;
+    if (steer_control_enabled) {
+      // Not our mode — fall back to stock checks
+      unsigned int raw_curvature = (msg->data[0] << 3) | (msg->data[1] >> 5);
+      unsigned int raw_curvature_rate = ((msg->data[1] & 0x1FU) << 8) | msg->data[2];
+      unsigned int raw_path_angle = (msg->data[3] << 3) | (msg->data[4] >> 5);
+      unsigned int raw_path_offset = (msg->data[5] << 2) | (msg->data[6] >> 6);
+      bool violation = (raw_curvature_rate != FORD_INACTIVE_CURVATURE_RATE) || (raw_path_angle != FORD_INACTIVE_PATH_ANGLE) || (raw_path_offset != FORD_INACTIVE_PATH_OFFSET);
+      int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;
+      violation |= steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_STEERING_LIMITS);
+      if (violation) tx = false;
     }
+    // else: LatCtl_D_Rq=0, always allow (passthrough mode)
   }
 
   // Safety check for LateralMotionControl2 action
