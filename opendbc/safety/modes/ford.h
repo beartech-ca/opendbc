@@ -294,28 +294,30 @@ static safety_config ford_init(uint16_t param) {
     {.msg = {{FORD_DesiredTorqBrk, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
 
+  // ford-lka: check_relay=false so our ford_fwd_hook controls blocking (engaged-only).
+  // The default safety_fwd_hook check_relay=true would block forwarding unconditionally.
   #define FORD_COMMON_TX_MSGS \
     {FORD_Steering_Data_FD1, 0, 8, .check_relay = false}, \
     {FORD_Steering_Data_FD1, 2, 8, .check_relay = false}, \
-    {FORD_ACCDATA_3, 0, 8, .check_relay = true},          \
-    {FORD_Lane_Assist_Data1, 0, 8, .check_relay = true},  \
-    {FORD_IPMA_Data, 0, 8, .check_relay = true},          \
+    {FORD_ACCDATA_3, 0, 8, .check_relay = false},          \
+    {FORD_Lane_Assist_Data1, 0, 8, .check_relay = false},  \
+    {FORD_IPMA_Data, 0, 8, .check_relay = false},          \
 
   static const CanMsg FORD_CANFD_LONG_TX_MSGS[] = {
     FORD_COMMON_TX_MSGS
-    {FORD_ACCDATA, 0, 8, .check_relay = true},
-    {FORD_LateralMotionControl2, 0, 8, .check_relay = true},
+    {FORD_ACCDATA, 0, 8, .check_relay = false},
+    {FORD_LateralMotionControl2, 0, 8, .check_relay = false},
   };
 
   static const CanMsg FORD_CANFD_STOCK_TX_MSGS[] = {
     FORD_COMMON_TX_MSGS
-    {FORD_LateralMotionControl2, 0, 8, .check_relay = true},
+    {FORD_LateralMotionControl2, 0, 8, .check_relay = false},
   };
 
   static const CanMsg FORD_LONG_TX_MSGS[] = {
     FORD_COMMON_TX_MSGS
-    {FORD_ACCDATA, 0, 8, .check_relay = true},
-    {FORD_LateralMotionControl, 0, 8, .check_relay = true},
+    {FORD_ACCDATA, 0, 8, .check_relay = false},
+    {FORD_LateralMotionControl, 0, 8, .check_relay = false},
   };
 
   const uint16_t FORD_PARAM_CANFD = 2;
