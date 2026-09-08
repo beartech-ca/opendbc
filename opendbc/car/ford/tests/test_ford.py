@@ -4,7 +4,7 @@ import unittest
 from hypothesis import settings, given, strategies as st
 
 from opendbc.car.structs import CarParams
-from opendbc.car.fw_versions import build_fw_dict
+from opendbc.car.fw_versions import build_fw_dict, match_fw_to_car
 from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
@@ -41,6 +41,19 @@ ECU_PART_NUMBER = {
 
 
 class TestFordFW(unittest.TestCase):
+  def test_transit_2022_exact_fw_match(self):
+    car_fw = [
+      CarParams.CarFw(ecu=Ecu.eps, fwVersion=b"KK21-14D003-AJ\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", brand="ford", address=0x730),
+      CarParams.CarFw(ecu=Ecu.abs, fwVersion=b"NK41-2D053-AF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", brand="ford", address=0x760),
+      CarParams.CarFw(ecu=Ecu.fwdRadar, fwVersion=b"LB5T-14D049-AB\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", brand="ford", address=0x764),
+      CarParams.CarFw(ecu=Ecu.fwdCamera, fwVersion=b"NK3T-14F397-AA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", brand="ford", address=0x706),
+    ]
+
+    exact, matches = match_fw_to_car(car_fw, "", allow_fuzzy=False, log=False)
+
+    assert exact
+    assert matches == {CAR.FORD_TRANSIT_MK5}
+
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:
       assert ecu in ECU_ADDRESSES, "Unknown ECU"
