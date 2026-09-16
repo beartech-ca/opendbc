@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import math
 import numpy as np
+import pathlib
 import random
 import unittest
 
@@ -537,23 +538,26 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LKA_STEER | FordSafetyFlags.LONG_CONTROL)
     self.safety.init_tests()
 
-  # Must match FORD_LKA_STEERING_LIMITS/PARAMS in ford.h
+  # Must match the FORD_LKA_* constants and FORD_LKA_STEERING_PARAMS in ford.h
   LKA_DEG_TO_CAN = 10
-  LKA_FREQUENCY = 33  # Hz
   LKA_SLIP_FACTOR = -0.0004472752575630534
   LKA_STEER_RATIO = 20.9
   LKA_WHEELBASE = 3.75
 
-  # steer_angle_cmd_checks_vm's own limits, which are not the car side's
+  # The safety's own lateral acceleration ceiling, which is not the car side's
   SAFETY_MAX_LATERAL_ACCEL = ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL)
-  SAFETY_MAX_LATERAL_JERK = 3.0 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL)
+
+  # LaRefAng_No_Req is 12 bits at 0.05 mrad/bit with a -102.4 mrad offset
+  LKA_REL_ANGLE_MIN_MRAD = -102.4
+  LKA_REL_ANGLE_MAX_MRAD = 102.35
+  LKA_MAX_REL_ANGLE_CAN = 59  # +/-5.9 deg in tenths, must match FORD_LKA_MAX_REL_ANGLE
 
   # LkaActvStats_D2_Req values that request steering: 1/6 increasing left/right
   # intervention, 2/4 standard left/right. 0 is idle, 3/5 suppress, 7 is NotUsed.
   LKA_STEERING_ACTIONS = (1, 2, 4, 6)
 
   def _fudged_speed(self, speed: float) -> float:
-    # steer_angle_cmd_checks_vm fudges the speed down by 1 m/s and floors it at 1 m/s
+    # the safety fudges the speed down by 1 m/s and floors it at 1 m/s
     return max(speed - 1.0, 1.0)
 
   def _curvature_factor(self, speed: float) -> float:
@@ -564,12 +568,6 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
     """The ISO lateral acceleration ceiling on an absolute angle command, in degrees."""
     max_curvature = self.SAFETY_MAX_LATERAL_ACCEL / (self._fudged_speed(speed) ** 2)
     return math.degrees(max_curvature * self.LKA_STEER_RATIO / self._curvature_factor(speed))
-
-  def _max_lka_angle_delta_deg(self, speed: float) -> float:
-    """The ISO lateral jerk ceiling on the step between two commands, in degrees."""
-    max_curvature_rate = self.SAFETY_MAX_LATERAL_JERK / (self._fudged_speed(speed) ** 2)
-    max_angle_rate = math.degrees(max_curvature_rate * self.LKA_STEER_RATIO / self._curvature_factor(speed))
-    return max_angle_rate / self.LKA_FREQUENCY
 
   # Measured pinion angle. StePinAn_No_Cs and StePinAn_No_Cnt are left at zero to match
   # what the Transit's PSCM actually transmits; see test_rx_hook_pinion_has_no_counter.
@@ -588,9 +586,6 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
     for _ in range(6):
       self._rx(self._speed_msg(speed))
       self._rx(self._speed_msg_2(speed))
-
-  def _set_prev_lka_angle(self, angle_deg: float):
-    self.safety.set_desired_angle_last(round(angle_deg * self.LKA_DEG_TO_CAN))
 
   # LKA command: action + angle relative to the current pinion angle
   def _lka_angle_msg(self, action: int, relative_mrad: float):
@@ -631,8 +626,8 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
 
   def test_heartbeat_frame_is_never_blocked(self):
     # The all-zero heartbeat payload decodes to a -5.9 deg relative request, which would
-    # be measured against the inactive bound and rejected unless the relative term is
-    # forced to zero whenever the action is not a steering request.
+    # become a real steering request unless the relative term is forced to zero whenever
+    # the action is not a steering request.
     for allowed in (0, 1):
       for angle in (0., 12.3, -12.3):
         self.safety.set_controls_allowed(allowed)
@@ -641,10 +636,9 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
           self.assertTrue(self._tx(self._lka_heartbeat_msg()))
 
   def test_inactive_frame_allowed_at_large_wheel_angles(self):
-    # StePinComp_An_Est is a steering-wheel-side angle spanning +/-1600 deg. The inactive
-    # branch clamps the measurement to max_angle but not the desired angle, so a ceiling
-    # below the real travel of the wheel rejects the heartbeat on every roundabout,
-    # junction and parking manoeuvre.
+    # StePinComp_An_Est is a steering-wheel-side angle spanning +/-1600 deg. An idle frame
+    # carries no steering request at all, so it must stay transmittable however far the
+    # wheel is turned: roundabouts, junctions and parking manoeuvres.
     for angle in (89., 91., -400., 1000., -1595.):
       for allowed in (0, 1):
         self.safety.set_controls_allowed(allowed)
@@ -663,8 +657,10 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
     assert self._tx(self._lka_angle_msg(2, 20.0))
 
   def test_max_lateral_acceleration(self):
-    # At road speed it is the vehicle model's lateral acceleration ceiling that bounds an
-    # absolute angle command: ~52 deg at 20 m/s, ~26 deg at 30 m/s.
+    # BOUND 2. The reconstructed absolute target (measured pinion angle + relative request)
+    # is bounded by the vehicle model's lateral acceleration ceiling: ~52 deg of wheel at
+    # 20 m/s, ~26 deg at 30 m/s. This is the bound that stops a sustained maximum relative
+    # request from winding the wheel up indefinitely.
     for speed in (20., 30.):
       max_angle_can = int(self._max_lka_angle_deg(speed) * self.LKA_DEG_TO_CAN) + 1
       for sign in (-1, 1):
@@ -673,30 +669,74 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
           self.safety.set_controls_allowed(1)
           self._reset_speed_measurement(speed)
           self._reset_pinion_measurement(angle)
-          self._set_prev_lka_angle(angle)
           with self.subTest(speed=speed, angle=angle):
             self.assertEqual(should_tx, self._tx(self._lka_angle_msg(2, 0.)))
 
-  def test_max_lateral_jerk(self):
-    # Each command is also bounded to a step from the previous one: ~2.7 deg at 15 m/s
-    speed = 15.
-    max_delta_can = int(self._max_lka_angle_delta_deg(speed) * self.LKA_DEG_TO_CAN) + 1
-    for sign in (-1, 1):
-      for delta_can, should_tx in ((max_delta_can, True), (max_delta_can + 1, False)):
-        angle = sign * 30.
-        self.safety.set_controls_allowed(1)
-        self._reset_speed_measurement(speed)
-        self._reset_pinion_measurement(angle)
-        self._set_prev_lka_angle(angle - (sign * delta_can / self.LKA_DEG_TO_CAN))
-        with self.subTest(delta_can=delta_can, sign=sign):
-          self.assertEqual(should_tx, self._tx(self._lka_angle_msg(2, 0.)))
+  def test_relative_request_magnitude(self):
+    # BOUND 1. LaRefAng_No_Req is a relative correction, and its 12-bit encoding already
+    # confines it to -5.867..+5.864 deg. The bound is repeated in the safety to catch
+    # panda's own bit extraction of the field being wrong, so what it must not do is sit
+    # below the encodable range: every value the signal can carry has to survive it.
+    # Checked at a standstill, where bound 2 is far too loose to bind.
+    self.safety.set_controls_allowed(1)
+    self._reset_speed_measurement(0.)
+    self._reset_pinion_measurement(0.)
+    for raw in range(0, 4096):
+      mrad = self.LKA_REL_ANGLE_MIN_MRAD + (raw * 0.05)
+      with self.subTest(raw=raw):
+        self.assertTrue(self._tx(self._lka_angle_msg(2, mrad)))
+        rel_can = round(math.degrees(mrad / 1000.) * self.LKA_DEG_TO_CAN)
+        self.assertLessEqual(abs(rel_can), self.LKA_MAX_REL_ANGLE_CAN)
+
+  def test_relative_request_magnitude_bound_is_present(self):
+    # BOUND 1, continued. The bound sits exactly at the ceiling of the signal's own
+    # encoding, so no CAN frame can reach it while the extraction is correct: it is
+    # unreachable defence in depth against the extraction itself being wrong, and no
+    # behavioural test can therefore fail on its deletion. What can be pinned is that it
+    # is still there, which is the risk a check nothing exercises actually carries.
+    # test_neighbouring_signal_does_not_move_the_request covers the extraction it guards.
+    ford_h = (pathlib.Path(__file__).parents[1] / "modes" / "ford.h").read_text()
+    self.assertIn(f"const int FORD_LKA_MAX_REL_ANGLE = {self.LKA_MAX_REL_ANGLE_CAN};", ford_h)
+    self.assertIn("violation |= safety_max_limit_check(rel_tenths, FORD_LKA_MAX_REL_ANGLE, "
+                  "-FORD_LKA_MAX_REL_ANGLE);", ford_h)
+
+  def test_neighbouring_signal_does_not_move_the_request(self):
+    # BOUND 1's failure mode. LaCurvature_No_Calc (15|12@0+) shares byte 2 with
+    # LaRefAng_No_Req (19|12@0+): the curvature occupies the top nibble, the relative
+    # angle request the bottom one. An extraction that lost the nibble mask would read the
+    # curvature into the angle request. Pin that the curvature cannot change the outcome,
+    # and that when it does leak the magnitude bound is what sees it: the largest value it
+    # could inject is ~181 deg of relative request, three orders of magnitude past the
+    # 5.9 deg ceiling.
+    self.safety.set_controls_allowed(1)
+    for speed in (0., 20.):
+      self._reset_speed_measurement(speed)
+      self._reset_pinion_measurement(0.)
+      for curvature in (-0.01024, 0., 0.01023):
+        values = {"LkaActvStats_D2_Req": 2, "LaRefAng_No_Req": 20.0, "LaCurvature_No_Calc": curvature}
+        msg = self.packer.make_can_msg_safety("Lane_Assist_Data1", 0, values)
+        with self.subTest(speed=speed, curvature=curvature):
+          self.assertTrue(self._tx(msg))
+
+  def test_no_rate_of_change_bound(self):
+    # Deliberate design decision, recorded so it is not silently reintroduced.
+    # LaRefAng_No_Req is not a position target openpilot ramps: it is the whole remaining
+    # correction, and the PSCM applies it over its own internal ramp. A per-frame step
+    # limit on the request therefore measures intent, not motion, and there is none here.
+    # Alternating between the extremes of the signal on consecutive frames must transmit.
+    self.safety.set_controls_allowed(1)
+    self._reset_speed_measurement(20.)
+    self._reset_pinion_measurement(0.)
+    for i in range(20):
+      mrad = self.LKA_REL_ANGLE_MAX_MRAD if (i % 2) == 0 else self.LKA_REL_ANGLE_MIN_MRAD
+      self.assertTrue(self._tx(self._lka_angle_msg(2, mrad)), f"frame {i} blocked")
 
   def test_measured_angle_sample_is_required(self):
     # Regression test for the trap: if the pinion angle sample were never updated by the
     # rx hook, the desired angle would be computed relative to a stale/zero measurement
-    # and a large actual angle would slip through. desired_angle_last resets to the
-    # measurement, so a jump this large is rejected by the jerk limit.
+    # and a large actual wheel angle would slip through bound 2.
     self.safety.set_controls_allowed(1)
+    self._reset_speed_measurement(20.)
     self._rx(self._pinion_angle_msg(900.0))
     # A single rx is enough for update_sample to move the current value,
     # even before the 6-sample window is entirely full of the new angle.
@@ -710,14 +750,13 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
       self.assertFalse(self._tx(self._lat_ctl_msg(True)))
 
   def test_lateral_motion_control_does_not_disturb_lka_state(self):
-    # openpilot sends 0x3D3 at 20Hz alongside the LKA command. Its check must not run the
-    # angle check, which shares desired_angle_last with the Lane_Assist_Data1 check: doing
-    # so resets the LKA target to zero on every frame and the jerk limit then rejects
-    # every single steering command.
+    # openpilot sends 0x3D3 at 20Hz alongside the LKA command. Its curvature angle check
+    # must not run on this platform: angle_meas holds the pinion angle in tenths of a
+    # degree here, not a curvature, so the curvature limits would be applied to the wrong
+    # unit scale and would reject the interleaved LKA commands.
     self.safety.set_controls_allowed(1)
     self._reset_speed_measurement(15.)
     self._reset_pinion_measurement(30.)
-    self._set_prev_lka_angle(30.)
     for i in range(8):
       self.assertTrue(self._tx(self._lat_ctl_msg(False)), f"0x3D3 blocked on frame {i}")
       self.assertTrue(self._tx(self._lka_angle_msg(2, 5.0)), f"0x3CA blocked on frame {i}")
@@ -743,7 +782,8 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
 
   def test_lateral_motion_control_2_is_gated_on_canfd_lka(self):
     # No platform sets both LKA_STEER and CANFD today, but ford_init accepts the
-    # combination, and LateralMotionControl2 would then share desired_angle_last too.
+    # combination, and LateralMotionControl2 would then run a curvature check against a
+    # pinion-angle angle_meas too.
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford,
                                  FordSafetyFlags.LKA_STEER | FordSafetyFlags.CANFD)
     self.safety.init_tests()
@@ -756,9 +796,8 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
     }
     self.safety.set_controls_allowed(1)
     self._reset_pinion_measurement(30.)
-    self._set_prev_lka_angle(30.)
     assert self._tx(self.packer.make_can_msg_safety("LateralMotionControl2", 0, values))
-    # the angle check must not have run, so the LKA target still tracks the pinion
+    # the curvature check must not have run, so the LKA command is still accepted
     assert self._tx(self._lka_angle_msg(2, 5.0))
 
     values["LatCtl_D2_Rq"] = 1

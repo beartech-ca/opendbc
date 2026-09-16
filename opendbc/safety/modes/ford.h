@@ -257,21 +257,27 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
         tx = false;
       }
     } else {
-      const AngleSteeringLimits FORD_LKA_STEERING_LIMITS = {
-        // Full range of StePinComp_An_Est (+/- 1600 deg). max_angle is load-bearing in the
-        // inactive branch of the check, which clamps the measurement to it but not the
-        // desired angle: any ceiling below the real travel of the steering wheel would
-        // reject every inactive frame once the wheel is turned past it. Only in the active
-        // branch does the vehicle-model lateral accel/jerk limit bind first.
-        .max_angle = 16000,
-        .angle_deg_to_can = 10,  // tenths of a degree, matches the pinion angle_meas sample
-        .frequency = 33U,        // Lane_Assist_Data1, see CarControllerParams.LKA_STEP
-      };
+      // LaRefAng_No_Req is not an absolute position target that openpilot ramps, which is
+      // what steer_angle_cmd_checks_vm's per-frame jerk term assumes. It is a RELATIVE
+      // correction carrying the whole remaining error, handed to the PSCM, which applies it
+      // over its own internal ramp. Rate-limiting the request would measure intent rather
+      // than motion, so this platform gets its own check with exactly two bounds: the
+      // magnitude of the relative request, and the ISO lateral acceleration of the absolute
+      // target it reconstructs to. There is deliberately no rate-of-change bound.
       const AngleSteeringParams FORD_LKA_STEERING_PARAMS = {
         .slip_factor = -0.0004472752575630534f,  // calc_slip_factor(VM) for FORD_TRANSIT_MK5
         .steer_ratio = 20.9,
         .wheelbase = 3.75,
       };
+      // tenths of a degree, matching the StePinComp_An_Est angle_meas sample
+      const float FORD_LKA_DEG_TO_CAN = 10.0f;
+      // LaRefAng_No_Req is 12 bits at 0.05 mrad/bit with a -102.4 mrad offset, so a
+      // correctly extracted request can only span -5.867..+5.864 deg: +/-5.9 deg, i.e.
+      // +/-59, once rounded to tenths of a degree.
+      const int FORD_LKA_MAX_REL_ANGLE = 59;
+      // Same value steer_angle_cmd_checks_vm uses: highway curves are rolled in the
+      // direction of the turn, so the ISO limit gets a superelevation tolerance
+      const float FORD_LKA_MAX_LATERAL_ACCEL = ISO_LATERAL_ACCEL + (EARTH_G * AVERAGE_ROAD_ROLL);  // ~3.6 m/s^2
 
       // Only the four intervention requests actuate steering: 1/6 increasing left/right,
       // 2/4 standard left/right. 0 is idle and 3/5 suppress LKA, neither of which steers,
@@ -281,8 +287,7 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
       bool valid_action = (action == 0U) || steer_control_enabled;
 
       // Signal: LaRefAng_No_Req : 19|12@0+ (0.05,-102.4) mrad, i.e. bits [19:8] of the
-      // message. It is RELATIVE to the current pinion angle, so reconstruct the absolute
-      // target in the same tenths-of-a-degree units as the angle_meas pinion sample.
+      // message. It is RELATIVE to the current pinion angle.
       unsigned int raw_rel = ((msg->data[2] & 0x0FU) << 8) | msg->data[3];
       float rel_mrad = ((float)raw_rel * 0.05f) - 102.4f;
       // mrad -> tenths of a degree: (rel_mrad / 1000 rad) * (180/pi deg/rad) * 10 tenths/deg
@@ -290,21 +295,41 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 
       // The PSCM ignores the requested angle when the action is idle, and openpilot's
       // heartbeat frame is an all-zero payload, which decodes to the bottom of the signal
-      // range (-102.4 mrad), not to zero. Zero the relative term so the target tracks the
-      // measurement exactly, which is what the inactive branch of the check requires.
+      // range (-102.4 mrad), not to zero. Zero the relative term so an idle frame carries
+      // no steering request at all.
       if (!steer_control_enabled) {
         rel_tenths = 0;
       }
-      int desired_angle = angle_meas.values[0] + rel_tenths;
 
-      // Matches tesla_tx_hook's calling convention: always run the check so its internal
-      // desired_angle_last rate limiting and angle_meas-based inactive/reset logic stay live.
-      if (steer_angle_cmd_checks_vm(desired_angle, steer_control_enabled, FORD_LKA_STEERING_LIMITS,
-                                    FORD_LKA_STEERING_PARAMS)) {
-        tx = false;
+      bool violation = false;
+
+      if (controls_allowed && steer_control_enabled) {
+        // *** relative request magnitude limit ***
+        // The signal encoding already bounds this on the car side; the bound is repeated
+        // here to catch panda's own bit extraction of LaRefAng_No_Req being wrong, a class
+        // of defect this port has hit twice. It guards the extraction, not the car.
+        violation |= safety_max_limit_check(rel_tenths, FORD_LKA_MAX_REL_ANGLE, -FORD_LKA_MAX_REL_ANGLE);
+
+        // *** ISO lateral accel limit on the reconstructed absolute target ***
+        // Identical in effect to steer_angle_cmd_checks_vm's lateral acceleration term:
+        // same fudged speed, same vehicle model helpers, same ceiling. This is what stops
+        // a sustained maximum relative request from winding the wheel up indefinitely.
+        const int desired_angle = angle_meas.values[0] + rel_tenths;
+        const float fudged_speed = SAFETY_MAX((vehicle_speed.min / VEHICLE_SPEED_FACTOR) - 1.0, 1.0);
+        const float curvature_factor = get_curvature_factor(fudged_speed, FORD_LKA_STEERING_PARAMS);
+        const float max_curvature = FORD_LKA_MAX_LATERAL_ACCEL / (fudged_speed * fudged_speed);
+        const float max_angle = get_angle_from_curvature(max_curvature, curvature_factor, FORD_LKA_STEERING_PARAMS);
+        const int max_angle_can = (int)((max_angle * FORD_LKA_DEG_TO_CAN) + 1.0f);
+
+        violation |= safety_max_limit_check(desired_angle, max_angle_can, -max_angle_can);
       }
 
-      if (!valid_action) {
+      // No steering request allowed when lateral control is not allowed
+      violation |= !controls_allowed && steer_control_enabled;
+
+      violation |= !valid_action;
+
+      if (violation) {
         tx = false;
       }
     }
@@ -325,9 +350,9 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     if (ford_lka_steer) {
       // LKA_STEER platforms steer through Lane_Assist_Data1; the PSCM ignores LCA/TJA here.
       // This message stays transmittable so the camera heartbeat to the PSCM survives, but
-      // it must never carry a steering request, and it must not run the angle check: that
-      // check shares desired_angle_last with the Lane_Assist_Data1 check above, which needs
-      // that state to track the pinion angle.
+      // it must never carry a steering request. The curvature angle check is not run here:
+      // angle_meas holds the pinion angle in tenths of a degree on these platforms, not a
+      // curvature, so the curvature limits would be applied to the wrong unit scale.
       violation |= steer_control_enabled;
     } else {
       // Check angle error and steer_control_enabled
@@ -357,7 +382,7 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     if (ford_lka_steer) {
       // No platform sets both LKA_STEER and CANFD today, but ford_init accepts the
       // combination. Same reasoning as LateralMotionControl above: no steering request,
-      // and no angle check, since desired_angle_last belongs to Lane_Assist_Data1.
+      // and no curvature angle check against a pinion-angle angle_meas.
       violation |= steer_control_enabled;
     } else {
       // Check angle error and steer_control_enabled
