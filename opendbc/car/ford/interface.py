@@ -6,7 +6,7 @@ from opendbc.car.ford.carcontroller import CarController
 from opendbc.car.ford.carstate import CarState
 from opendbc.car.ford.fordcan import CanBus
 from opendbc.car.ford.radar_interface import RadarInterface
-from opendbc.car.ford.values import CarControllerParams, DBC, Ecu, FordFlags, RADAR, FordSafetyFlags
+from opendbc.car.ford.values import CAR, CarControllerParams, DBC, Ecu, FordFlags, RADAR, FordSafetyFlags
 from opendbc.car.interfaces import CarInterfaceBase
 
 TransmissionType = structs.CarParams.TransmissionType
@@ -56,6 +56,9 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LONG_CONTROL.value
       ret.openpilotLongitudinalControl = True
 
+    if ret.flags & FordFlags.LKA_STEER:
+      ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LKA_STEER.value
+
     if ret.flags & FordFlags.CANFD:
       ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.CANFD.value
 
@@ -76,13 +79,20 @@ class CarInterface(CarInterfaceBase):
         else:
           config_tja = pscm_config.fwVersion[7]  # Traffic Jam Assist
           config_lca = pscm_config.fwVersion[8]  # Lane Centering Assist
-          if config_tja != 0xFF or config_lca != 0xFF:
+          # LKA_STEER platforms drive Lane_Assist_Data1 (0x3CA) and never use
+          # the LCA/TJA channel, so the PSCM's TJA/LCA config bytes say nothing
+          # about whether openpilot can steer them.
+          if not (ret.flags & FordFlags.LKA_STEER) and (config_tja != 0xFF or config_lca != 0xFF):
             carlog.error('dashcamOnly: Car lacks required lateral control APIs')
             ret.dashcamOnly = True
 
     # Auto Transmission: 0x732 ECU or Gear_Shift_by_Wire_FD1
     found_ecus = [fw.ecu for fw in car_fw]
-    if Ecu.shiftByWire in found_ecus or 0x5A in fingerprint[CAN.main] or docs:
+    # Transit MK5 reports neither a shiftByWire ECU nor 0x5A, but its automatic
+    # gearbox is visible as PRND in main-bus 0x176.
+    automatic_gearbox = (Ecu.shiftByWire in found_ecus or 0x5A in fingerprint[CAN.main] or docs or
+                         (candidate == CAR.FORD_TRANSIT_MK5 and 0x176 in fingerprint[CAN.main]))
+    if automatic_gearbox:
       ret.transmissionType = TransmissionType.automatic
     else:
       ret.transmissionType = TransmissionType.manual

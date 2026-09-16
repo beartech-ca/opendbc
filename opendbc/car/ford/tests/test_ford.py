@@ -173,3 +173,61 @@ class TestTransitFingerprint(unittest.TestCase):
       # a single flipped byte must not still match
       corrupted = bytes([fw[0] ^ 0xFF]) + fw[1:]
       assert corrupted not in flat[addr], f"corrupted firmware should not match for {hex(addr)}"
+
+
+from opendbc.car.structs import CarParams
+from opendbc.car.ford.interface import CarInterface
+from opendbc.car.ford.values import FordSafetyFlags
+
+TransmissionType = CarParams.TransmissionType
+
+
+class TestTransitInterface:
+  def _params(self, fingerprint_main, car_fw=None, candidate=CAR.FORD_TRANSIT_MK5):
+    return CarInterface.get_params(candidate,
+                                   {0: fingerprint_main, 2: {}},
+                                   car_fw or [], alpha_long=False, is_release=True, docs=False)
+
+  @staticmethod
+  def _pscm_asbuilt_fw(tja, lca):
+    # interface.py finds the PSCM AsBuilt block-2 response (request 0x22 0xDE01,
+    # see ford_asbuilt_block_request/ASBUILT_BLOCKS in values.py) by ecu + request
+    # substring, then reads fwVersion[7]/[8] as the TJA/LCA config bytes.
+    fw = bytearray(24)
+    fw[7] = tja   # Traffic Jam Assist
+    fw[8] = lca   # Lane Centering Assist
+    return CarParams.CarFw(ecu=Ecu.eps, address=ECU_ADDRESSES[Ecu.eps], request=[b'\x22\xDE\x01'], fwVersion=bytes(fw))
+
+  def test_0x176_means_automatic(self):
+    # 0x176 carries PRND and gears 1-10 on this van; it has neither a
+    # shiftByWire ECU nor 0x5A, so upstream would call it a manual and impose
+    # a 20 mph minimum enable speed.
+    ret = self._params({0x176: 8})
+    assert ret.transmissionType == TransmissionType.automatic
+    assert ret.minEnableSpeed == -1
+
+  def test_no_0x176_stays_manual(self):
+    ret = self._params({})
+    assert ret.transmissionType == TransmissionType.manual
+
+  def test_not_dashcam_only(self):
+    # A PSCM AsBuilt config with non-0xFF TJA/LCA bytes would normally mark a
+    # Ford dashcamOnly (it looks like the car lacks the LCA/TJA CAN APIs), but
+    # the Transit drives steering via Lane_Assist_Data1 (LKA_STEER) instead of
+    # that channel, so the guard must stay off for it even with this firmware
+    # present.
+    pscm_fw = self._pscm_asbuilt_fw(tja=0x01, lca=0x01)
+    ret = self._params({0x176: 8}, car_fw=[pscm_fw])
+    assert not ret.dashcamOnly
+
+  def test_dashcam_gate_discriminates_by_lka_steer_flag(self):
+    # Proves test_not_dashcam_only isn't vacuous: the exact same PSCM firmware
+    # on a Ford platform without FordFlags.LKA_STEER (Escape MK4, which drives
+    # the LCA/TJA channel) must still trip dashcamOnly.
+    pscm_fw = self._pscm_asbuilt_fw(tja=0x01, lca=0x01)
+    ret = self._params({}, car_fw=[pscm_fw], candidate=CAR.FORD_ESCAPE_MK4)
+    assert ret.dashcamOnly
+
+  def test_lka_safety_flag_set(self):
+    ret = self._params({0x176: 8})
+    assert ret.safetyConfigs[-1].safetyParam & FordSafetyFlags.LKA_STEER
