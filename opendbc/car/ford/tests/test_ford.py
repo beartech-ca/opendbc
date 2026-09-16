@@ -5,7 +5,7 @@ from hypothesis import settings, given, strategies as st
 
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
-from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
+from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes, FordFlags
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
 
@@ -36,6 +36,9 @@ ECU_PART_NUMBER = {
   Ecu.fwdCamera: [
     b"14F397",  # Ford Q3
     b"14H102",  # Ford Q4
+  ],
+  Ecu.engine: [
+    b"14C204",
   ],
 }
 
@@ -140,3 +143,33 @@ class TestFordFW(unittest.TestCase):
     live_fw[(0x760, None)] = {b"M1MC-2D053-XX\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"}
     candidates = FW_QUERY_CONFIG.match_fw_to_car_fuzzy(live_fw, '', {expected_fingerprint: offline_fw})
     assert len(candidates) == 0, "Should not match new model year hint"
+
+
+class TestTransitFingerprint(unittest.TestCase):
+  # Recorded on the owner's van on 2026-09-16. The ADAS and parkingAdas ECUs also answered
+  # during that capture, but both responses have fw.logging=True and build_fw_dict() drops
+  # logging entries (opendbc/car/fw_versions.py), so they never participate in fingerprint
+  # matching and are intentionally not listed here.
+  RECORDED = {
+    (0x730, None): b'KK21-14D003-AJ\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    (0x760, None): b'NK41-2D053-AF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    (0x7E0, None): b'NK41-14C204-AFD\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    (0x706, None): b'NK3T-14F397-AA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    (0x764, None): b'LB5T-14D049-AB\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+  }
+
+  def test_transit_platform_exists(self):
+    assert CAR.FORD_TRANSIT_MK5 in FW_VERSIONS
+    assert CAR.FORD_TRANSIT_MK5.config.flags & FordFlags.LKA_STEER
+
+  def test_recorded_firmware_is_listed(self):
+    listed = FW_VERSIONS[CAR.FORD_TRANSIT_MK5]
+    flat = {}
+    for (_ecu, addr, sub), versions in listed.items():
+      flat.setdefault(addr, []).extend(versions)
+    assert set(flat) == {addr for addr, _sub in self.RECORDED}, "unexpected set of ECU addresses"
+    for (addr, _sub), fw in self.RECORDED.items():
+      assert fw in flat[addr], f"firmware {fw!r} missing for {hex(addr)}"
+      # a single flipped byte must not still match
+      corrupted = bytes([fw[0] ^ 0xFF]) + fw[1:]
+      assert corrupted not in flat[addr], f"corrupted firmware should not match for {hex(addr)}"

@@ -46,11 +46,14 @@ class CarControllerParams:
 class FordSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   CANFD = 2
+  LKA_STEER = 4
 
 
 class FordFlags(IntFlag):
   # Static flags
   CANFD = 1
+  # Steers through Lane_Assist_Data1 (0x3CA) because the PSCM ignores LCA/TJA
+  LKA_STEER = 2
 
 
 class RADAR:
@@ -109,6 +112,13 @@ class FordCANFDPlatformConfig(FordPlatformConfig):
   def init(self):
     super().init()
     self.flags |= FordFlags.CANFD
+
+
+@dataclass
+class FordLkaPlatformConfig(FordPlatformConfig):
+  def init(self):
+    super().init()
+    self.flags |= FordFlags.LKA_STEER
 
 
 @dataclass
@@ -177,6 +187,29 @@ class CAR(Platforms):
   FORD_RANGER_MK2 = FordCANFDPlatformConfig(
     [FordCarDocs("Ford Ranger 2024", "Adaptive Cruise Control with Lane Centering", setup_video="https://www.youtube.com/watch?v=2oJlXCKYOy0")],
     CarSpecs(mass=2000, wheelbase=3.27, steerRatio=17.0),
+  )
+  FORD_TRANSIT_MK5 = FordLkaPlatformConfig(
+    [FordCarDocs("Ford Transit 2022-23", "Lane Keeping Aid")],
+    # T-350 AWD cargo van, long wheelbase high roof (VIN decode via NHTSA vPIC:
+    # 2022 Transit 350, Cargo Van, AWD, 3.5 L V6, GVWR class 2H).
+    # mass: 2864. Derivation, because this is NOT the curb weight and the
+    #   convention in interfaces.py says CarSpecs.mass should be:
+    #     owner-reported curb weight            2500 kg
+    #     owner-reported weight as actually     3000 kg  (tools and cargo aboard)
+    #       driven
+    #     openpilot adds STD_CARGO_KG = 136 kg at interfaces.py:148
+    #     so CarSpecs.mass = 3000 - 136        = 2864 kg  -> 3000 kg effective
+    #   Using the convention literally would give CarSpecs.mass = 2500 and an
+    #   effective 2636 kg, which is 12% under how the van is actually driven.
+    #   Mass feeds rotationalInertia and the tire-stiffness scaling; it does NOT
+    #   affect slip_factor, where it cancels.
+    # wheelbase: owner-confirmed 148 in.
+    # steerRatio: 20.9, from a least-squares fit of yaw-rate-derived curvature
+    #   against steering angle over 11,658 recorded samples at 36-86 km/h
+    #   (r = 0.967). The fit pins steerRatio * wheelbase = 78.43 m; the wheelbase
+    #   above splits it. paramsd's own live estimates on three routes were
+    #   17.87 / 19.21 / 22.97, which bracket this.
+    CarSpecs(mass=2864, wheelbase=3.750, steerRatio=20.9),
   )
 
 
