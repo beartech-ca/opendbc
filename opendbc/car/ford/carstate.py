@@ -19,6 +19,7 @@ class CarState(CarStateBase):
 
     self.distance_button = 0
     self.lc_button = 0
+    self.lkas_available = False
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -55,6 +56,11 @@ class CarState(CarStateBase):
     if self.CP.flags & FordFlags.CANFD:
       # this signal is always 0 on non-CAN FD cars
       ret.steerFaultTemporary |= cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"] not in (1, 2, 3)
+
+    # LaActAvail_D_Actl: 3 "LKA_LCA_LDW_Avail", 2 "LCA_LKA_Avail_LDW_Suppress",
+    # 1 "LCA_LKA_Suppress_LDW_Avail", 0 "LCA_LKA_LDW_Suppress". LKA is offered
+    # in both 3 and 2 - 2 only suppresses the LDW warning.
+    self.lkas_available = cp.vl["Lane_Assist_Data3_FD1"]["LaActAvail_D_Actl"] in (2, 3)
 
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False

@@ -124,11 +124,34 @@ class CarController(CarControllerBase):
         mode = 1 if CC.latActive else 0
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode, 0., 0., -self.apply_curvature_last, 0., counter))
+      elif self.CP.flags & FordFlags.LKA_STEER:
+        # LKA_STEER platforms steer through Lane_Assist_Data1 (0x3CA) below; the PSCM
+        # ignores LCA/TJA here. LateralMotionControl (0x3D3) shares limiter state with
+        # the Lane_Assist_Data1 angle check in panda, so it must go out as an
+        # always-inactive heartbeat - never with a steering request - or panda will
+        # block it as a transmit violation while the actual command is on 0x3CA.
+        can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, False, 0., 0., 0., 0.))
       else:
         can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, CC.latActive, 0., 0., -self.apply_curvature_last, 0.))
 
     # send lka msg at 33Hz
-    if (self.frame % CarControllerParams.LKA_STEP) == 0:
+    if self.CP.flags & FordFlags.LKA_STEER:
+      if (self.frame % CarControllerParams.LKA_STEP) == 0:
+        lka_active = CC.latActive and CS.lkas_available
+        apply_angle = 0.0
+        action = 0
+        if lka_active:
+          apply_angle = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
+          # direction follows the REQUESTED delta sign, with a deadband so a
+          # centred wheel does not bias one way. Task 5 makes the mapping and
+          # the intervention level configurable; standard/left-positive here.
+          if apply_angle > 0.1:
+            action = 2
+          elif apply_angle < -0.1:
+            action = 4
+        can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN, lka_active,
+                                                apply_angle, action, 0))
+    elif (self.frame % CarControllerParams.LKA_STEP) == 0:
       can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN))
 
     ### longitudinal control ###

@@ -1,3 +1,6 @@
+import math
+import numpy as np
+
 from opendbc.car import CanBusBase, structs
 
 HUDControl = structs.CarControl.HUDControl
@@ -33,16 +36,44 @@ def calculate_lat_ctl2_checksum(mode: int, counter: int, dat: bytearray) -> int:
   return 0xFF - (checksum & 0xFF)
 
 
-def create_lka_msg(packer, CAN: CanBus):
-  """
-  Creates an empty CAN message for the Ford LKA Command.
+LKA_MAX_ANGLE_DEG = 5.8      # LaRefAng_No_Req saturates at +-102.4 mrad
+LKA_MAX_ANGLE_MRAD = 102.3
 
-  This command can apply "Lane Keeping Aid" maneuvers, which are subject to the PSCM lockout.
+
+def create_lka_msg(packer, CAN: CanBus, lat_active: bool = False, apply_angle_deg: float = 0.0,
+                   action: int = 0, ramp_type: int = 0):
+  """
+  Creates a CAN message for the Ford LKA Command.
+
+  On platforms whose PSCM ignores LCA/TJA this is the steering channel.
+  `apply_angle_deg` is RELATIVE to the current wheel angle and saturates at
+  +-5.8 deg. `action` is LkaActvStats_D2_Req (2/4 standard, 1/6 increasing,
+  0 inactive); `ramp_type` is LaRampType_B_Req (0 slow, 1 fast).
 
   Frequency is 33Hz.
   """
+  if lat_active:
+    clipped = float(np.clip(apply_angle_deg, -LKA_MAX_ANGLE_DEG, LKA_MAX_ANGLE_DEG))
+    mrad = float(np.clip(math.radians(clipped) * 1000.0,
+                         -LKA_MAX_ANGLE_MRAD, LKA_MAX_ANGLE_MRAD))
+  else:
+    # LaRefAng_No_Req has a DBC offset of -102.4 mrad, so an empty/zero-raw
+    # payload does not decode to zero - it decodes to -102.4 mrad. Pack the
+    # value 0.0 explicitly so the inactive heartbeat tracks the current angle.
+    mrad = 0.0
+    action = 0
+    ramp_type = 0
 
-  return packer.make_can_msg("Lane_Assist_Data1", CAN.main, {})
+  values = {
+    "LkaDrvOvrrd_D_Rq": 0,
+    "LkaActvStats_D2_Req": action,
+    "LaRefAng_No_Req": mrad,
+    "LaRampType_B_Req": ramp_type,
+    "LaCurvature_No_Calc": 0,
+    "LdwActvStats_D_Req": 0,
+    "LdwActvIntns_D_Req": 3,
+  }
+  return packer.make_can_msg("Lane_Assist_Data1", CAN.main, values)
 
 
 def create_lat_ctl_msg(packer, CAN: CanBus, lat_active: bool, path_offset: float, path_angle: float, curvature: float,

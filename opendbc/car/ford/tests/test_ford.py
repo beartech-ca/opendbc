@@ -231,3 +231,108 @@ class TestTransitInterface:
   def test_lka_safety_flag_set(self):
     ret = self._params({0x176: 8})
     assert ret.safetyConfigs[-1].safetyParam & FordSafetyFlags.LKA_STEER
+
+
+import math
+
+from opendbc.can import CANPacker, CANParser
+from opendbc.car.ford import fordcan
+
+
+class TestTransitLkaMessage:
+  def setup_method(self):
+    self.packer = CANPacker("ford_lincoln_base_pt")
+    # CanBus() bare (no CP, no fingerprint) asserts in CanBusBase.__init__;
+    # every other caller in this codebase passes one or the other, so we do
+    # the same here rather than loosen CanBus's default for test convenience.
+    self.CAN = fordcan.CanBus(None, {0: {}})
+
+  def _decode_lane_assist_data1(self, addr, dat):
+    # Register the message via the constructor rather than relying on
+    # CANParser's lazy registration on first `parser.vl[...]` access -
+    # otherwise the first update() call registers-and-skips the frame
+    # instead of parsing it, and vl[...] silently reads back the default 0.
+    parser = CANParser("ford_lincoln_base_pt", [("Lane_Assist_Data1", 0)], 0)
+    parser.update([(0, [(addr, dat, 0)])])
+    return parser.vl["Lane_Assist_Data1"]
+
+  def test_inactive_sends_zero_action(self):
+    addr, dat, bus = fordcan.create_lka_msg(self.packer, self.CAN, False, 3.0, 4, 1)
+    assert addr == 0x3CA
+    assert (dat[0] >> 5) == 0
+
+    # LaRefAng_No_Req has a DBC offset of -102.4 mrad, so an all-zero raw
+    # payload decodes to -102.4 mrad, not 0. An earlier revision shipped
+    # exactly that and panda blocked every heartbeat frame. Decode through
+    # the real DBC (rather than re-deriving the bit layout by hand here) to
+    # lock in that the packed *value* is actually 0.
+    vals = self._decode_lane_assist_data1(addr, dat)
+    assert vals["LaRefAng_No_Req"] == 0.0
+
+  def test_active_sends_requested_action(self):
+    addr, dat, _bus = fordcan.create_lka_msg(self.packer, self.CAN, True, 3.0, 4, 1)
+    assert (dat[0] >> 5) == 4
+
+    vals = self._decode_lane_assist_data1(addr, dat)
+    assert vals["LkaActvStats_D2_Req"] == 4
+
+  def test_angle_is_clipped_to_the_wire_limit(self):
+    addr, hi, _b = fordcan.create_lka_msg(self.packer, self.CAN, True, 99.0, 2, 0)
+    _a, cap, _b = fordcan.create_lka_msg(self.packer, self.CAN, True, 5.8, 2, 0)
+    assert hi == cap
+
+    # The identity check above would still pass if clipping were broken in a
+    # way that made both calls pack the same *wrong* value (e.g. always 0
+    # mrad). Decode and check against the actual wire limit to rule that out.
+    vals = self._decode_lane_assist_data1(addr, hi)
+    assert math.isclose(vals["LaRefAng_No_Req"], math.radians(5.8) * 1000.0, abs_tol=0.05)
+
+
+from opendbc.car import structs
+from opendbc.car.car_helpers import interfaces
+
+
+class TestTransitLateralMotionControlHeartbeat:
+  """
+  Task 3 made LatCtl_D_Rq != 0 on LateralMotionControl (0x3D3) a transmit
+  violation for LKA_STEER platforms, because that check shares limiter state
+  with the Lane_Assist_Data1 (0x3CA) angle check. Lateral control must always
+  go out on 0x3CA for these platforms; 0x3D3 may only ever carry an inactive
+  heartbeat so the PSCM-to-camera link stays alive.
+  """
+
+  def _run(self, candidate, steering_angle_deg=10.0, curvature=0.01, frames=20):
+    CarInterface = interfaces[candidate]
+    car_params = CarInterface.get_params(candidate, {0: {}, 2: {}}, [], alpha_long=False, is_release=True, docs=False)
+    car_interface = CarInterface(car_params)
+    car_interface.update([])
+
+    CC = structs.CarControl()
+    CC.enabled = True
+    CC.latActive = True
+    CC.actuators.steeringAngleDeg = steering_angle_deg
+    CC.actuators.curvature = curvature
+    CC = CC.as_reader()
+
+    parser = CANParser("ford_lincoln_base_pt", [], 0)
+    lat_ctl_rq_seen = []
+    for i in range(frames):
+      _, can_sends = car_interface.apply(CC, i)
+      for addr, dat, _bus in can_sends:
+        if addr == 0x3D3:
+          parser.update([(0, [(addr, dat, 0)])])
+          lat_ctl_rq_seen.append(parser.vl["LateralMotionControl"]["LatCtl_D_Rq"])
+
+    assert len(lat_ctl_rq_seen) > 0, "LateralMotionControl was never sent"
+    return lat_ctl_rq_seen
+
+  def test_lka_steer_platform_never_requests_lateral_on_0x3d3(self):
+    lat_ctl_rq_seen = self._run(CAR.FORD_TRANSIT_MK5)
+    assert all(v == 0 for v in lat_ctl_rq_seen), \
+      f"LKA_STEER platform requested lateral on LateralMotionControl (0x3D3): {lat_ctl_rq_seen}"
+
+  def test_non_lka_steer_platform_keeps_stock_behavior(self):
+    # Proves the above isn't vacuous: a non-LKA_STEER platform steers through
+    # LateralMotionControl and must still request lateral there when active.
+    lat_ctl_rq_seen = self._run(CAR.FORD_BRONCO_SPORT_MK1)
+    assert any(v != 0 for v in lat_ctl_rq_seen)
