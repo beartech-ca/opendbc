@@ -4,6 +4,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
+from opendbc.car.ford.transit_lka import TransitLkaState, Intervention, Ramp, DirectionSign
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -75,6 +76,14 @@ class CarController(CarControllerBase):
     self.lead_distance_bars_last = None
     self.distance_bar_frame = 0
 
+    self.transit_lka = None
+    if CP.flags & FordFlags.LKA_STEER:
+      self.transit_lka = TransitLkaState(Intervention(CP.transitLka.intervention),
+                                         Ramp(CP.transitLka.ramp),
+                                         DirectionSign(CP.transitLka.directionSign))
+      self.desired_angle_last = 0.0
+      self.lka_active_last = False
+
   def update(self, CC, CS, now_nanos):
     can_sends = []
 
@@ -139,18 +148,24 @@ class CarController(CarControllerBase):
       if (self.frame % CarControllerParams.LKA_STEP) == 0:
         lka_active = CC.latActive and CS.lkas_available
         apply_angle = 0.0
-        action = 0
+        action, ramp_type = 0, 0
         if lka_active:
           apply_angle = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
-          # direction follows the REQUESTED delta sign, with a deadband so a
-          # centred wheel does not bias one way. Task 5 makes the mapping and
-          # the intervention level configurable; standard/left-positive here.
-          if apply_angle > 0.1:
-            action = 2
-          elif apply_angle < -0.1:
-            action = 4
+          # demand_rate is only meaningful once desired_angle_last was itself
+          # sampled while active - on the first active frame the previous
+          # sample is the pre-engagement (held-at-current-angle) target, and
+          # diffing against it would produce a spurious huge rate.
+          if self.lka_active_last:
+            demand_rate = (actuators.steeringAngleDeg - self.desired_angle_last) / DT_CTRL / CarControllerParams.LKA_STEP
+          else:
+            demand_rate = 0.0
+          action, ramp_type = self.transit_lka.update(apply_angle, actuators.steeringAngleDeg, demand_rate)
+        else:
+          self.transit_lka.reset()
+        self.desired_angle_last = actuators.steeringAngleDeg
+        self.lka_active_last = lka_active
         can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN, lka_active,
-                                                apply_angle, action, 0))
+                                                apply_angle, action, ramp_type))
     elif (self.frame % CarControllerParams.LKA_STEP) == 0:
       can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN))
 

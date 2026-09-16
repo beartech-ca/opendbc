@@ -37,9 +37,6 @@ ECU_PART_NUMBER = {
     b"14F397",  # Ford Q3
     b"14H102",  # Ford Q4
   ],
-  Ecu.engine: [
-    b"14C204",
-  ],
 }
 
 
@@ -146,14 +143,14 @@ class TestFordFW(unittest.TestCase):
 
 
 class TestTransitFingerprint(unittest.TestCase):
-  # Recorded on the owner's van on 2026-09-16. The ADAS and parkingAdas ECUs also answered
-  # during that capture, but both responses have fw.logging=True and build_fw_dict() drops
-  # logging entries (opendbc/car/fw_versions.py), so they never participate in fingerprint
-  # matching and are intentionally not listed here.
+  # Recorded on the owner's van on 2026-09-16. The ADAS, parkingAdas, and engine (PCM,
+  # 0x7E0 - listed in FW_QUERY_CONFIG.extra_ecus) ECUs also answered during that capture,
+  # but all three responses have fw.logging=True and build_fw_dict() drops logging entries
+  # (opendbc/car/fw_versions.py), so they never participate in fingerprint matching and are
+  # intentionally not listed here or in FW_VERSIONS.
   RECORDED = {
     (0x730, None): b'KK21-14D003-AJ\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     (0x760, None): b'NK41-2D053-AF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
-    (0x7E0, None): b'NK41-14C204-AFD\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     (0x706, None): b'NK3T-14F397-AA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     (0x764, None): b'LB5T-14D049-AB\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
   }

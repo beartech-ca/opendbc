@@ -34,6 +34,9 @@ non_tested_cars = [
   TOYOTA.TOYOTA_COROLLA,
   TOYOTA.TOYOTA_RAV4H,
 
+  # Route data is private customer data (owner's van) and is not published; no public CI route
+  # will ever exist for this platform, unlike the FIXME entries above which are awaiting one.
+  FORD.FORD_TRANSIT_MK5,
 ]
 
 
