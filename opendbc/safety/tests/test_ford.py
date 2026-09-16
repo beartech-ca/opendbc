@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+import math
 import numpy as np
 import random
 import unittest
 
 import opendbc.safety.tests.common as common
-from opendbc.car.ford.carcontroller import MAX_LATERAL_ACCEL
+from opendbc.car import ACCELERATION_DUE_TO_GRAVITY
+from opendbc.car.ford.carcontroller import AVERAGE_ROAD_ROLL, MAX_LATERAL_ACCEL
 from opendbc.car.ford.values import FordSafetyFlags
+from opendbc.car.lateral import ISO_LATERAL_ACCEL
 from opendbc.car.structs import CarParams
 from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.safety.tests.common import CANPackerSafety
@@ -15,6 +18,7 @@ MSG_EngVehicleSpThrottle = 0x204   # RX from PCM, for driver throttle input
 MSG_BrakeSysFeatures = 0x415       # RX from ABS, for vehicle speed
 MSG_EngVehicleSpThrottle2 = 0x202  # RX from PCM, for second vehicle speed
 MSG_Yaw_Data_FD1 = 0x91            # RX from RCM, for yaw rate
+MSG_SteeringPinion_Data = 0x07E    # RX from PSCM, measured steering pinion angle
 MSG_Steering_Data_FD1 = 0x083      # TX by OP, various driver switches and LKAS/CC buttons
 MSG_ACCDATA = 0x186                # TX by OP, ACC controls
 MSG_ACCDATA_3 = 0x18A              # TX by OP, ACC/TJA user interface
@@ -167,27 +171,6 @@ class TestFordSafetyBase(common.CarSafetyTest):
     }
     return self.packer.make_can_msg_safety("Lane_Assist_Data1", 0, values)
 
-  # LCA command
-  def _lat_ctl_msg(self, enabled: bool, path_offset: float, path_angle: float, curvature: float, curvature_rate: float):
-    if self.STEER_MESSAGE == MSG_LateralMotionControl:
-      values = {
-        "LatCtl_D_Rq": 1 if enabled else 0,
-        "LatCtlPathOffst_L_Actl": path_offset,     # Path offset [-5.12|5.11] meter
-        "LatCtlPath_An_Actl": path_angle,          # Path angle [-0.5|0.5235] radians
-        "LatCtlCurv_NoRate_Actl": curvature_rate,  # Curvature rate [-0.001024|0.00102375] 1/meter^2
-        "LatCtlCurv_No_Actl": curvature,           # Curvature [-0.02|0.02094] 1/meter
-      }
-      return self.packer.make_can_msg_safety("LateralMotionControl", 0, values)
-    elif self.STEER_MESSAGE == MSG_LateralMotionControl2:
-      values = {
-        "LatCtl_D2_Rq": 1 if enabled else 0,
-        "LatCtlPathOffst_L_Actl": path_offset,     # Path offset [-5.12|5.11] meter
-        "LatCtlPath_An_Actl": path_angle,          # Path angle [-0.5|0.5235] radians
-        "LatCtlCrv_NoRate2_Actl": curvature_rate,  # Curvature rate [-0.001024|0.001023] 1/meter^2
-        "LatCtlCurv_No_Actl": curvature,           # Curvature [-0.02|0.02094] 1/meter
-      }
-      return self.packer.make_can_msg_safety("LateralMotionControl2", 0, values)
-
   # Cruise control buttons
   def _acc_button_msg(self, button: int, bus: int):
     values = {
@@ -219,6 +202,56 @@ class TestFordSafetyBase(common.CarSafetyTest):
         should_rx = msg_type == "speed_2" and quality_flag
         self.assertEqual(should_rx, self._rx(msg))
         self.assertEqual(should_rx, self.safety.get_controls_allowed())
+
+  def test_prevent_lkas_action(self):
+    self.safety.set_controls_allowed(1)
+    self.assertFalse(self._tx(self._lkas_command_msg(1)))
+
+    self.safety.set_controls_allowed(0)
+    self.assertFalse(self._tx(self._lkas_command_msg(1)))
+
+  def test_acc_buttons(self):
+    for allowed in (0, 1):
+      self.safety.set_controls_allowed(allowed)
+      for enabled in (True, False):
+        self._rx(self._pcm_status_msg(enabled))
+        self.assertTrue(self._tx(self._acc_button_msg(Buttons.TJA_TOGGLE, 2)))
+
+    for allowed in (0, 1):
+      self.safety.set_controls_allowed(allowed)
+      for bus in (0, 2):
+        self.assertEqual(allowed, self._tx(self._acc_button_msg(Buttons.RESUME, bus)))
+
+    for enabled in (True, False):
+      self._rx(self._pcm_status_msg(enabled))
+      for bus in (0, 2):
+        self.assertEqual(enabled, self._tx(self._acc_button_msg(Buttons.CANCEL, bus)))
+
+
+class TestFordCurvatureSteeringBase(TestFordSafetyBase):
+  """Tests for the LCA/TJA curvature channel. Platforms that steer through
+  Lane_Assist_Data1 inherit TestFordSafetyBase directly and skip these."""
+
+  # LCA command
+  def _lat_ctl_msg(self, enabled: bool, path_offset: float, path_angle: float, curvature: float, curvature_rate: float):
+    if self.STEER_MESSAGE == MSG_LateralMotionControl:
+      values = {
+        "LatCtl_D_Rq": 1 if enabled else 0,
+        "LatCtlPathOffst_L_Actl": path_offset,     # Path offset [-5.12|5.11] meter
+        "LatCtlPath_An_Actl": path_angle,          # Path angle [-0.5|0.5235] radians
+        "LatCtlCurv_NoRate_Actl": curvature_rate,  # Curvature rate [-0.001024|0.00102375] 1/meter^2
+        "LatCtlCurv_No_Actl": curvature,           # Curvature [-0.02|0.02094] 1/meter
+      }
+      return self.packer.make_can_msg_safety("LateralMotionControl", 0, values)
+    elif self.STEER_MESSAGE == MSG_LateralMotionControl2:
+      values = {
+        "LatCtl_D2_Rq": 1 if enabled else 0,
+        "LatCtlPathOffst_L_Actl": path_offset,     # Path offset [-5.12|5.11] meter
+        "LatCtlPath_An_Actl": path_angle,          # Path angle [-0.5|0.5235] radians
+        "LatCtlCrv_NoRate2_Actl": curvature_rate,  # Curvature rate [-0.001024|0.001023] 1/meter^2
+        "LatCtlCurv_No_Actl": curvature,           # Curvature [-0.02|0.02094] 1/meter
+      }
+      return self.packer.make_can_msg_safety("LateralMotionControl2", 0, values)
 
   def test_angle_measurements(self):
     """Tests rx hook correctly parses the curvature measurement from the vehicle speed and yaw rate"""
@@ -360,32 +393,8 @@ class TestFordSafetyBase(common.CarSafetyTest):
             self._set_prev_desired_angle(sign * (curvature_offset + initial_curvature))
             self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(True, 0, 0, sign * (curvature_offset + desired_curvature), 0)))
 
-  def test_prevent_lkas_action(self):
-    self.safety.set_controls_allowed(1)
-    self.assertFalse(self._tx(self._lkas_command_msg(1)))
 
-    self.safety.set_controls_allowed(0)
-    self.assertFalse(self._tx(self._lkas_command_msg(1)))
-
-  def test_acc_buttons(self):
-    for allowed in (0, 1):
-      self.safety.set_controls_allowed(allowed)
-      for enabled in (True, False):
-        self._rx(self._pcm_status_msg(enabled))
-        self.assertTrue(self._tx(self._acc_button_msg(Buttons.TJA_TOGGLE, 2)))
-
-    for allowed in (0, 1):
-      self.safety.set_controls_allowed(allowed)
-      for bus in (0, 2):
-        self.assertEqual(allowed, self._tx(self._acc_button_msg(Buttons.RESUME, bus)))
-
-    for enabled in (True, False):
-      self._rx(self._pcm_status_msg(enabled))
-      for bus in (0, 2):
-        self.assertEqual(enabled, self._tx(self._acc_button_msg(Buttons.CANCEL, bus)))
-
-
-class TestFordCANFDStockSafety(TestFordSafetyBase):
+class TestFordCANFDStockSafety(TestFordCurvatureSteeringBase):
   STEER_MESSAGE = MSG_LateralMotionControl2
 
   TX_MSGS = [
@@ -405,7 +414,7 @@ class TestFordCANFDStockSafety(TestFordSafetyBase):
     self.safety.init_tests()
 
 
-class TestFordLongitudinalSafetyBase(TestFordSafetyBase):
+class TestFordLongitudinalSafetyBase(TestFordCurvatureSteeringBase):
   MAX_ACCEL = 2.0  # accel is used for brakes, but openpilot can set positive values
   MIN_ACCEL = -3.5
   INACTIVE_ACCEL = 0.0
@@ -499,6 +508,261 @@ class TestFordCANFDLongitudinalSafety(TestFordLongitudinalSafetyBase):
     self.safety = libsafety_py.libsafety
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD)
     self.safety.init_tests()
+
+
+class TestFordTransitLkaSafety(TestFordSafetyBase):
+  """
+  Tests for the LKA_STEER platforms (e.g. Transit MK5), which steer through
+  Lane_Assist_Data1 (0x3CA) directly instead of the LCA/TJA curvature channel.
+  Inherits TestFordSafetyBase directly, not TestFordCurvatureSteeringBase,
+  since the curvature-channel tests don't apply here.
+  """
+  STEER_MESSAGE = MSG_Lane_Assist_Data1
+
+  TX_MSGS = [
+    [MSG_Steering_Data_FD1, 0], [MSG_Steering_Data_FD1, 2], [MSG_ACCDATA, 0], [MSG_ACCDATA_3, 0], [MSG_Lane_Assist_Data1, 0],
+    [MSG_LateralMotionControl, 0], [MSG_IPMA_Data, 0],
+  ]
+  RELAY_MALFUNCTION_ADDRS = {0: (MSG_ACCDATA, MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl,
+                                 MSG_IPMA_Data)}
+
+  FWD_BLACKLISTED_ADDRS = {2: [MSG_ACCDATA, MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl,
+                               MSG_IPMA_Data]}
+
+  def setUp(self):
+    self.packer = CANPackerSafety("ford_lincoln_base_pt")
+    self.safety = libsafety_py.libsafety
+    # Matches interface.py: LKA_STEER platforms always set LONG_CONTROL too,
+    # since FORD_TRANSIT_MK5 has a radar and is not CAN FD.
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LKA_STEER | FordSafetyFlags.LONG_CONTROL)
+    self.safety.init_tests()
+
+  # Must match FORD_LKA_STEERING_LIMITS/PARAMS in ford.h
+  LKA_DEG_TO_CAN = 10
+  LKA_FREQUENCY = 33  # Hz
+  LKA_SLIP_FACTOR = -0.0004472752575630534
+  LKA_STEER_RATIO = 20.9
+  LKA_WHEELBASE = 3.75
+
+  # steer_angle_cmd_checks_vm's own limits, which are not the car side's
+  SAFETY_MAX_LATERAL_ACCEL = ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL)
+  SAFETY_MAX_LATERAL_JERK = 3.0 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL)
+
+  # LkaActvStats_D2_Req values that request steering: 1/6 increasing left/right
+  # intervention, 2/4 standard left/right. 0 is idle, 3/5 suppress, 7 is NotUsed.
+  LKA_STEERING_ACTIONS = (1, 2, 4, 6)
+
+  def _fudged_speed(self, speed: float) -> float:
+    # steer_angle_cmd_checks_vm fudges the speed down by 1 m/s and floors it at 1 m/s
+    return max(speed - 1.0, 1.0)
+
+  def _curvature_factor(self, speed: float) -> float:
+    fudged_speed = self._fudged_speed(speed)
+    return 1. / (1. - (self.LKA_SLIP_FACTOR * fudged_speed ** 2)) / self.LKA_WHEELBASE
+
+  def _max_lka_angle_deg(self, speed: float) -> float:
+    """The ISO lateral acceleration ceiling on an absolute angle command, in degrees."""
+    max_curvature = self.SAFETY_MAX_LATERAL_ACCEL / (self._fudged_speed(speed) ** 2)
+    return math.degrees(max_curvature * self.LKA_STEER_RATIO / self._curvature_factor(speed))
+
+  def _max_lka_angle_delta_deg(self, speed: float) -> float:
+    """The ISO lateral jerk ceiling on the step between two commands, in degrees."""
+    max_curvature_rate = self.SAFETY_MAX_LATERAL_JERK / (self._fudged_speed(speed) ** 2)
+    max_angle_rate = math.degrees(max_curvature_rate * self.LKA_STEER_RATIO / self._curvature_factor(speed))
+    return max_angle_rate / self.LKA_FREQUENCY
+
+  # Measured pinion angle. StePinAn_No_Cs and StePinAn_No_Cnt are left at zero to match
+  # what the Transit's PSCM actually transmits; see test_rx_hook_pinion_has_no_counter.
+  def _pinion_angle_msg(self, angle_deg: float, quality_flag: bool = True):
+    values = {
+      "StePinComp_An_Est": angle_deg,
+      "StePinCompAnEst_D_Qf": 3 if quality_flag else 0,
+    }
+    return self.packer.make_can_msg_safety("SteeringPinion_Data", 0, values)
+
+  def _reset_pinion_measurement(self, angle_deg: float):
+    for _ in range(6):
+      self._rx(self._pinion_angle_msg(angle_deg))
+
+  def _reset_speed_measurement(self, speed: float):
+    for _ in range(6):
+      self._rx(self._speed_msg(speed))
+      self._rx(self._speed_msg_2(speed))
+
+  def _set_prev_lka_angle(self, angle_deg: float):
+    self.safety.set_desired_angle_last(round(angle_deg * self.LKA_DEG_TO_CAN))
+
+  # LKA command: action + angle relative to the current pinion angle
+  def _lka_angle_msg(self, action: int, relative_mrad: float):
+    values = {
+      "LkaActvStats_D2_Req": action,
+      "LaRefAng_No_Req": relative_mrad,
+    }
+    return self.packer.make_can_msg_safety("Lane_Assist_Data1", 0, values)
+
+  def _lka_heartbeat_msg(self):
+    # The frame openpilot actually sends when it is not steering: fordcan.create_lka_msg
+    # packs an all-zero payload, and raw zero in LaRefAng_No_Req is -102.4 mrad, not 0.
+    return self.packer.make_can_msg_safety("Lane_Assist_Data1", 0, {})
+
+  # LCA/TJA message. The PSCM ignores it on this platform, but openpilot still sends it
+  # at 20Hz, so it stays TX-whitelisted as part of the camera heartbeat.
+  def _lat_ctl_msg(self, enabled: bool, curvature: float = 0.):
+    values = {
+      "LatCtl_D_Rq": 1 if enabled else 0,
+      "LatCtlPathOffst_L_Actl": 0.,
+      "LatCtlPath_An_Actl": 0.,
+      "LatCtlCurv_NoRate_Actl": 0.,
+      "LatCtlCurv_No_Actl": curvature,
+    }
+    return self.packer.make_can_msg_safety("LateralMotionControl", 0, values)
+
+  def test_prevent_lkas_action(self):
+    # Lane_Assist_Data1 is the real LKA channel here, so a non-zero action is not
+    # unconditionally blocked. Only the four intervention requests are whitelisted:
+    # the suppress values and the reserved one are rejected rather than guessed at.
+    for action in range(8):
+      for allowed in (0, 1):
+        self.safety.set_controls_allowed(allowed)
+        self._reset_pinion_measurement(0.)
+        should_tx = (action == 0) or (action in self.LKA_STEERING_ACTIONS and allowed)
+        with self.subTest(action=action, allowed=allowed):
+          self.assertEqual(should_tx, self._tx(self._lka_angle_msg(action, 0.)))
+
+  def test_heartbeat_frame_is_never_blocked(self):
+    # The all-zero heartbeat payload decodes to a -5.9 deg relative request, which would
+    # be measured against the inactive bound and rejected unless the relative term is
+    # forced to zero whenever the action is not a steering request.
+    for allowed in (0, 1):
+      for angle in (0., 12.3, -12.3):
+        self.safety.set_controls_allowed(allowed)
+        self._reset_pinion_measurement(angle)
+        with self.subTest(allowed=allowed, angle=angle):
+          self.assertTrue(self._tx(self._lka_heartbeat_msg()))
+
+  def test_inactive_frame_allowed_at_large_wheel_angles(self):
+    # StePinComp_An_Est is a steering-wheel-side angle spanning +/-1600 deg. The inactive
+    # branch clamps the measurement to max_angle but not the desired angle, so a ceiling
+    # below the real travel of the wheel rejects the heartbeat on every roundabout,
+    # junction and parking manoeuvre.
+    for angle in (89., 91., -400., 1000., -1595.):
+      for allowed in (0, 1):
+        self.safety.set_controls_allowed(allowed)
+        self._reset_pinion_measurement(angle)
+        with self.subTest(angle=angle, allowed=allowed):
+          self.assertTrue(self._tx(self._lka_heartbeat_msg()))
+
+  def test_action_blocked_when_controls_not_allowed(self):
+    self.safety.set_controls_allowed(0)
+    self._reset_pinion_measurement(0.)
+    assert not self._tx(self._lka_angle_msg(2, 20.0))
+
+  def test_small_request_allowed_when_controls_allowed(self):
+    self.safety.set_controls_allowed(1)
+    self._reset_pinion_measurement(0.)
+    assert self._tx(self._lka_angle_msg(2, 20.0))
+
+  def test_max_lateral_acceleration(self):
+    # At road speed it is the vehicle model's lateral acceleration ceiling that bounds an
+    # absolute angle command: ~52 deg at 20 m/s, ~26 deg at 30 m/s.
+    for speed in (20., 30.):
+      max_angle_can = int(self._max_lka_angle_deg(speed) * self.LKA_DEG_TO_CAN) + 1
+      for sign in (-1, 1):
+        for angle_can, should_tx in ((max_angle_can, True), (max_angle_can + 1, False)):
+          angle = sign * angle_can / self.LKA_DEG_TO_CAN
+          self.safety.set_controls_allowed(1)
+          self._reset_speed_measurement(speed)
+          self._reset_pinion_measurement(angle)
+          self._set_prev_lka_angle(angle)
+          with self.subTest(speed=speed, angle=angle):
+            self.assertEqual(should_tx, self._tx(self._lka_angle_msg(2, 0.)))
+
+  def test_max_lateral_jerk(self):
+    # Each command is also bounded to a step from the previous one: ~2.7 deg at 15 m/s
+    speed = 15.
+    max_delta_can = int(self._max_lka_angle_delta_deg(speed) * self.LKA_DEG_TO_CAN) + 1
+    for sign in (-1, 1):
+      for delta_can, should_tx in ((max_delta_can, True), (max_delta_can + 1, False)):
+        angle = sign * 30.
+        self.safety.set_controls_allowed(1)
+        self._reset_speed_measurement(speed)
+        self._reset_pinion_measurement(angle)
+        self._set_prev_lka_angle(angle - (sign * delta_can / self.LKA_DEG_TO_CAN))
+        with self.subTest(delta_can=delta_can, sign=sign):
+          self.assertEqual(should_tx, self._tx(self._lka_angle_msg(2, 0.)))
+
+  def test_measured_angle_sample_is_required(self):
+    # Regression test for the trap: if the pinion angle sample were never updated by the
+    # rx hook, the desired angle would be computed relative to a stale/zero measurement
+    # and a large actual angle would slip through. desired_angle_last resets to the
+    # measurement, so a jump this large is rejected by the jerk limit.
+    self.safety.set_controls_allowed(1)
+    self._rx(self._pinion_angle_msg(900.0))
+    # A single rx is enough for update_sample to move the current value,
+    # even before the 6-sample window is entirely full of the new angle.
+    assert not self._tx(self._lka_angle_msg(2, 20.0))
+
+  def test_lateral_motion_control_carries_no_steering_request(self):
+    # LCA/TJA cannot steer this PSCM, so the message may only go out inactive
+    for allowed in (0, 1):
+      self.safety.set_controls_allowed(allowed)
+      self.assertTrue(self._tx(self._lat_ctl_msg(False)))
+      self.assertFalse(self._tx(self._lat_ctl_msg(True)))
+
+  def test_lateral_motion_control_does_not_disturb_lka_state(self):
+    # openpilot sends 0x3D3 at 20Hz alongside the LKA command. Its check must not run the
+    # angle check, which shares desired_angle_last with the Lane_Assist_Data1 check: doing
+    # so resets the LKA target to zero on every frame and the jerk limit then rejects
+    # every single steering command.
+    self.safety.set_controls_allowed(1)
+    self._reset_speed_measurement(15.)
+    self._reset_pinion_measurement(30.)
+    self._set_prev_lka_angle(30.)
+    for i in range(8):
+      self.assertTrue(self._tx(self._lat_ctl_msg(False)), f"0x3D3 blocked on frame {i}")
+      self.assertTrue(self._tx(self._lka_angle_msg(2, 5.0)), f"0x3CA blocked on frame {i}")
+
+  def test_rx_hook_pinion_quality_flag(self):
+    # The pinion angle is the origin every steering command is measured from, so an
+    # uninitialised or degraded PSCM estimate must not be accepted.
+    for quality_flag in (True, False):
+      self.safety.set_controls_allowed(True)
+      for _ in range(10):
+        self.assertEqual(quality_flag, self._rx(self._pinion_angle_msg(0., quality_flag=quality_flag)))
+        self.assertEqual(quality_flag, self.safety.get_controls_allowed())
+
+  def test_rx_hook_pinion_has_no_counter(self):
+    # This PSCM does not transmit StePinAn_No_Cs or StePinAn_No_Cnt: both are a constant
+    # zero across 856k captured frames, and the DBC says the checksum is "not transmitted
+    # on gas variants". Checking either would invalidate the message after
+    # MAX_WRONG_COUNTERS frames and permanently disable controls on the van.
+    self.safety.set_controls_allowed(True)
+    for _ in range(4 * common.MAX_WRONG_COUNTERS):
+      assert self._rx(self._pinion_angle_msg(0.))
+      assert self.safety.get_controls_allowed()
+
+  def test_lateral_motion_control_2_is_gated_on_canfd_lka(self):
+    # No platform sets both LKA_STEER and CANFD today, but ford_init accepts the
+    # combination, and LateralMotionControl2 would then share desired_angle_last too.
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford,
+                                 FordSafetyFlags.LKA_STEER | FordSafetyFlags.CANFD)
+    self.safety.init_tests()
+    values = {
+      "LatCtl_D2_Rq": 0,
+      "LatCtlPathOffst_L_Actl": 0.,
+      "LatCtlPath_An_Actl": 0.,
+      "LatCtlCrv_NoRate2_Actl": 0.,
+      "LatCtlCurv_No_Actl": 0.,
+    }
+    self.safety.set_controls_allowed(1)
+    self._reset_pinion_measurement(30.)
+    self._set_prev_lka_angle(30.)
+    assert self._tx(self.packer.make_can_msg_safety("LateralMotionControl2", 0, values))
+    # the angle check must not have run, so the LKA target still tracks the pinion
+    assert self._tx(self._lka_angle_msg(2, 5.0))
+
+    values["LatCtl_D2_Rq"] = 1
+    assert not self._tx(self.packer.make_can_msg_safety("LateralMotionControl2", 0, values))
 
 
 if __name__ == "__main__":

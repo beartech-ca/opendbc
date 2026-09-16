@@ -9,6 +9,7 @@
 #define FORD_BrakeSysFeatures      0x415U   // RX from ABS, for vehicle speed
 #define FORD_EngVehicleSpThrottle2 0x202U   // RX from PCM, for second vehicle speed
 #define FORD_Yaw_Data_FD1          0x91U    // RX from RCM, for yaw rate
+#define FORD_SteeringPinion_Data   0x07EU   // RX from PSCM, measured steering pinion angle
 #define FORD_Steering_Data_FD1     0x083U   // TX by OP, various driver switches and LKAS/CC buttons
 #define FORD_ACCDATA               0x186U   // TX by OP, ACC controls
 #define FORD_ACCDATA_3             0x18AU   // TX by OP, ACC/TJA user interface
@@ -20,6 +21,10 @@
 // CAN bus numbers.
 #define FORD_MAIN_BUS 0U
 #define FORD_CAM_BUS  2U
+
+// Set for LKA_STEER platforms, which steer through Lane_Assist_Data1 (the PSCM
+// ignores LCA/TJA on these) instead of the LCA/TJA curvature channel.
+static bool ford_lka_steer = false;
 
 static uint8_t ford_get_counter(const CANPacket_t *msg) {
   uint8_t cnt = 0;
@@ -74,6 +79,8 @@ static bool ford_get_quality_flag_valid(const CANPacket_t *msg) {
     valid = ((msg->data[4] >> 5) & 0x3U) == 0x3U;  // VehVActlEng_D_Qf
   } else if (msg->addr == FORD_Yaw_Data_FD1) {
     valid = ((msg->data[6] >> 4) & 0x3U) == 0x3U;  // VehYawWActl_D_Qf
+  } else if (msg->addr == FORD_SteeringPinion_Data) {
+    valid = ((msg->data[5] >> 2) & 0x3U) == 0x3U;  // StePinCompAnEst_D_Qf, 3 = OK
   } else {
   }
   return valid;
@@ -133,13 +140,25 @@ static void ford_rx_hook(const CANPacket_t *msg) {
     }
 
     // Update vehicle yaw rate
-    if (msg->addr == FORD_Yaw_Data_FD1) {
+    // LKA_STEER platforms steer through the pinion angle instead (see FORD_SteeringPinion_Data
+    // below); angle_meas is shared state and must not be fed two incompatible unit scales.
+    if ((msg->addr == FORD_Yaw_Data_FD1) && !ford_lka_steer) {
       // Signal: VehYaw_W_Actl
       // TODO: we should use the speed which results in the closest angle measurement to the desired angle
       float ford_yaw_rate = (((msg->data[2] << 8U) | msg->data[3]) * 0.0002) - 6.5;
       float current_curvature = ford_yaw_rate / SAFETY_MAX(vehicle_speed.values[0] / VEHICLE_SPEED_FACTOR, 0.1);
       // convert current curvature into units on CAN for comparison with desired curvature
       update_sample(&angle_meas, ROUND(current_curvature * FORD_STEERING_LIMITS.angle_deg_to_can));
+    }
+
+    // Update measured steering pinion angle, used by LKA_STEER platforms to bound
+    // Lane_Assist_Data1 angle requests (see ford_tx_hook)
+    if ((msg->addr == FORD_SteeringPinion_Data) && ford_lka_steer) {
+      // Signal: StePinComp_An_Est : 22|15@0+ (0.1,-1600) degrees
+      // 15 bits, 0.1 deg/bit, -1600 deg offset -> tenths of a degree, matching
+      // FORD_LKA_STEERING_LIMITS.angle_deg_to_can
+      const int pinion_angle = (((msg->data[2] & 0x7FU) << 8) | msg->data[3]) - 16000U;
+      update_sample(&angle_meas, pinion_angle);
     }
 
     // Update gas pedal
@@ -225,13 +244,69 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 
   // Safety check for Lane_Assist_Data1 action
   if (msg->addr == FORD_Lane_Assist_Data1) {
-    // Do not allow steering using Lane_Assist_Data1 (Lane-Departure Aid).
-    // This message must be sent for Lane Centering to work, and can include
-    // values such as the steering angle or lane curvature for debugging,
-    // but the action (LkaActvStats_D2_Req) must be set to zero.
+    // Signal: LkaActvStats_D2_Req : 7|3@0+ (1,0), i.e. the top 3 bits of byte 0
     unsigned int action = msg->data[0] >> 5;
-    if (action != 0U) {
-      tx = false;
+
+    if (!ford_lka_steer) {
+      // Do not allow steering using Lane_Assist_Data1 (Lane-Departure Aid) on
+      // upstream platforms, which steer through LCA/TJA instead. This message
+      // must still be sent for Lane Centering to work, and can include values
+      // such as the steering angle or lane curvature for debugging, but the
+      // action (LkaActvStats_D2_Req) must be set to zero.
+      if (action != 0U) {
+        tx = false;
+      }
+    } else {
+      const AngleSteeringLimits FORD_LKA_STEERING_LIMITS = {
+        // Full range of StePinComp_An_Est (+/- 1600 deg). max_angle is load-bearing in the
+        // inactive branch of the check, which clamps the measurement to it but not the
+        // desired angle: any ceiling below the real travel of the steering wheel would
+        // reject every inactive frame once the wheel is turned past it. Only in the active
+        // branch does the vehicle-model lateral accel/jerk limit bind first.
+        .max_angle = 16000,
+        .angle_deg_to_can = 10,  // tenths of a degree, matches the pinion angle_meas sample
+        .frequency = 33U,        // Lane_Assist_Data1, see CarControllerParams.LKA_STEP
+      };
+      const AngleSteeringParams FORD_LKA_STEERING_PARAMS = {
+        .slip_factor = -0.0004472752575630534f,  // calc_slip_factor(VM) for FORD_TRANSIT_MK5
+        .steer_ratio = 20.9,
+        .wheelbase = 3.75,
+      };
+
+      // Only the four intervention requests actuate steering: 1/6 increasing left/right,
+      // 2/4 standard left/right. 0 is idle and 3/5 suppress LKA, neither of which steers,
+      // and 7 is NotUsed. Whitelist the values we understand rather than guess what the
+      // PSCM does with a reserved one (see tesla_tx_hook's steer control type check).
+      bool steer_control_enabled = (action == 1U) || (action == 2U) || (action == 4U) || (action == 6U);
+      bool valid_action = (action == 0U) || steer_control_enabled;
+
+      // Signal: LaRefAng_No_Req : 19|12@0+ (0.05,-102.4) mrad, i.e. bits [19:8] of the
+      // message. It is RELATIVE to the current pinion angle, so reconstruct the absolute
+      // target in the same tenths-of-a-degree units as the angle_meas pinion sample.
+      unsigned int raw_rel = ((msg->data[2] & 0x0FU) << 8) | msg->data[3];
+      float rel_mrad = ((float)raw_rel * 0.05f) - 102.4f;
+      // mrad -> tenths of a degree: (rel_mrad / 1000 rad) * (180/pi deg/rad) * 10 tenths/deg
+      int rel_tenths = ROUND(rel_mrad * (1.8f / 3.14159265f));
+
+      // The PSCM ignores the requested angle when the action is idle, and openpilot's
+      // heartbeat frame is an all-zero payload, which decodes to the bottom of the signal
+      // range (-102.4 mrad), not to zero. Zero the relative term so the target tracks the
+      // measurement exactly, which is what the inactive branch of the check requires.
+      if (!steer_control_enabled) {
+        rel_tenths = 0;
+      }
+      int desired_angle = angle_meas.values[0] + rel_tenths;
+
+      // Matches tesla_tx_hook's calling convention: always run the check so its internal
+      // desired_angle_last rate limiting and angle_meas-based inactive/reset logic stay live.
+      if (steer_angle_cmd_checks_vm(desired_angle, steer_control_enabled, FORD_LKA_STEERING_LIMITS,
+                                    FORD_LKA_STEERING_PARAMS)) {
+        tx = false;
+      }
+
+      if (!valid_action) {
+        tx = false;
+      }
     }
   }
 
@@ -247,9 +322,18 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // These signals are not yet tested with the current safety limits
     bool violation = (raw_curvature_rate != FORD_INACTIVE_CURVATURE_RATE) || (raw_path_angle != FORD_INACTIVE_PATH_ANGLE) || (raw_path_offset != FORD_INACTIVE_PATH_OFFSET);
 
-    // Check angle error and steer_control_enabled
-    int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;  // /FORD_STEERING_LIMITS.angle_deg_to_can to get real curvature
-    violation |= steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_STEERING_LIMITS);
+    if (ford_lka_steer) {
+      // LKA_STEER platforms steer through Lane_Assist_Data1; the PSCM ignores LCA/TJA here.
+      // This message stays transmittable so the camera heartbeat to the PSCM survives, but
+      // it must never carry a steering request, and it must not run the angle check: that
+      // check shares desired_angle_last with the Lane_Assist_Data1 check above, which needs
+      // that state to track the pinion angle.
+      violation |= steer_control_enabled;
+    } else {
+      // Check angle error and steer_control_enabled
+      int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;  // /FORD_STEERING_LIMITS.angle_deg_to_can to get real curvature
+      violation |= steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_STEERING_LIMITS);
+    }
 
     if (violation) {
       tx = false;
@@ -270,9 +354,16 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // These signals are not yet tested with the current safety limits
     bool violation = (raw_curvature_rate != FORD_CANFD_INACTIVE_CURVATURE_RATE) || (raw_path_angle != FORD_INACTIVE_PATH_ANGLE) || (raw_path_offset != FORD_INACTIVE_PATH_OFFSET);
 
-    // Check angle error and steer_control_enabled
-    int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;  // /FORD_STEERING_LIMITS.angle_deg_to_can to get real curvature
-    violation |= steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_CANFD_STEERING_LIMITS);
+    if (ford_lka_steer) {
+      // No platform sets both LKA_STEER and CANFD today, but ford_init accepts the
+      // combination. Same reasoning as LateralMotionControl above: no steering request,
+      // and no angle check, since desired_angle_last belongs to Lane_Assist_Data1.
+      violation |= steer_control_enabled;
+    } else {
+      // Check angle error and steer_control_enabled
+      int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;  // /FORD_STEERING_LIMITS.angle_deg_to_can to get real curvature
+      violation |= steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_CANFD_STEERING_LIMITS);
+    }
 
     if (violation) {
       tx = false;
@@ -285,17 +376,35 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 static safety_config ford_init(uint16_t param) {
   // warning: quality flags are not yet checked in openpilot's CAN parser,
   // this may be the cause of blocked messages
-  static RxCheck ford_rx_checks[] = {
-    {.msg = {{FORD_BrakeSysFeatures, 0, 8, 50U, .max_counter = 15U}, { 0 }, { 0 }}},
-    // FORD_EngVehicleSpThrottle2 has a counter that either randomly skips or by 2, likely ECU bug
-    // Some hybrid models also experience a bug where this checksum mismatches for one or two frames under heavy acceleration with ACC
-    // It has been confirmed that the Bronco Sport's camera only disallows ACC for bad quality flags, not counters or checksums, so we match that
-    {.msg = {{FORD_EngVehicleSpThrottle2, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_Yaw_Data_FD1, 0, 8, 100U, .max_counter = 255U}, { 0 }, { 0 }}},
-    // These messages have no counter or checksum
-    {.msg = {{FORD_EngBrakeData, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_EngVehicleSpThrottle, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+  #define FORD_COMMON_RX_CHECKS \
+    {.msg = {{FORD_BrakeSysFeatures, 0, 8, 50U, .max_counter = 15U}, { 0 }, { 0 }}},                                        \
+    /* FORD_EngVehicleSpThrottle2 has a counter that either randomly skips or by 2, likely ECU bug */                      \
+    /* Some hybrid models also experience a bug where this checksum mismatches for one or two frames */                    \
+    /* under heavy acceleration with ACC. It has been confirmed that the Bronco Sport's camera only */                     \
+    /* disallows ACC for bad quality flags, not counters or checksums, so we match that */                                 \
+    {.msg = {{FORD_EngVehicleSpThrottle2, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},      \
+    {.msg = {{FORD_Yaw_Data_FD1, 0, 8, 100U, .max_counter = 255U}, { 0 }, { 0 }}},                                          \
+    /* These messages have no counter or checksum */                                                                       \
+    {.msg = {{FORD_EngBrakeData, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_EngVehicleSpThrottle, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
     {.msg = {{FORD_DesiredTorqBrk, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+
+  static RxCheck ford_rx_checks[] = {
+    FORD_COMMON_RX_CHECKS
+  };
+
+  // LKA_STEER platforms additionally require the measured pinion angle to bound
+  // Lane_Assist_Data1 angle requests; scoped to these platforms only so a missing
+  // or stale SteeringPinion_Data message can't disable controls on other Fords.
+  static RxCheck ford_lka_rx_checks[] = {
+    FORD_COMMON_RX_CHECKS
+    // The pinion angle is what bounds the Lane_Assist_Data1 command, so StePinCompAnEst_D_Qf
+    // is checked: an uninitialised or degraded PSCM estimate must not become the origin a
+    // steering command is measured from. StePinAn_No_Cs and StePinAn_No_Cnt are not checked
+    // because this PSCM does not transmit them: both are a constant zero across 856k frames
+    // of Transit MK5 capture, matching the DBC's "Signal not transmitted on gas variants".
+    // Enforcing either would invalidate every frame and permanently disable controls.
+    {.msg = {{FORD_SteeringPinion_Data, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},
   };
 
   #define FORD_COMMON_TX_MSGS \
@@ -325,6 +434,9 @@ static safety_config ford_init(uint16_t param) {
   const uint16_t FORD_PARAM_CANFD = 2;
   const bool ford_canfd = GET_FLAG(param, FORD_PARAM_CANFD);
 
+  const uint16_t FORD_PARAM_LKA_STEER = 4;
+  ford_lka_steer = GET_FLAG(param, FORD_PARAM_LKA_STEER);
+
   bool ford_longitudinal = false;
 
 #ifdef ALLOW_DEBUG
@@ -336,11 +448,20 @@ static safety_config ford_init(uint16_t param) {
   ford_longitudinal = !ford_canfd || ford_longitudinal;
 
   safety_config ret;
-  if (ford_canfd) {
-    ret = ford_longitudinal ? BUILD_SAFETY_CFG(ford_rx_checks, FORD_CANFD_LONG_TX_MSGS) : \
-                              BUILD_SAFETY_CFG(ford_rx_checks, FORD_CANFD_STOCK_TX_MSGS);
+  if (ford_lka_steer) {
+    if (ford_canfd) {
+      ret = ford_longitudinal ? BUILD_SAFETY_CFG(ford_lka_rx_checks, FORD_CANFD_LONG_TX_MSGS) : \
+                                BUILD_SAFETY_CFG(ford_lka_rx_checks, FORD_CANFD_STOCK_TX_MSGS);
+    } else {
+      ret = BUILD_SAFETY_CFG(ford_lka_rx_checks, FORD_LONG_TX_MSGS);
+    }
   } else {
-    ret = BUILD_SAFETY_CFG(ford_rx_checks, FORD_LONG_TX_MSGS);
+    if (ford_canfd) {
+      ret = ford_longitudinal ? BUILD_SAFETY_CFG(ford_rx_checks, FORD_CANFD_LONG_TX_MSGS) : \
+                                BUILD_SAFETY_CFG(ford_rx_checks, FORD_CANFD_STOCK_TX_MSGS);
+    } else {
+      ret = BUILD_SAFETY_CFG(ford_rx_checks, FORD_LONG_TX_MSGS);
+    }
   }
   return ret;
 }
