@@ -1,9 +1,10 @@
 import copy
 import re
 from dataclasses import dataclass, field, replace
-from enum import Enum, IntFlag
+from enum import Enum, IntEnum, IntFlag
 
 from opendbc.car import Bus, CarSpecs, DbcDict, PlatformConfig, Platforms, uds
+from opendbc.car.carlog import carlog
 from opendbc.car.lateral import AngleSteeringLimits
 from opendbc.car.structs import CarParams
 from opendbc.car.docs_definitions import CarFootnote, CarHarness, CarDocs, CarParts, Column
@@ -63,13 +64,13 @@ class FordFlags(IntFlag):
 #
 #   bit    0  FordFlags.CANFD
 #   bit    1  FordFlags.LKA_STEER
-#   bits 2-3  Transit LKA intervention   (transit_lka.Intervention,   0-2)
-#   bits 4-5  Transit LKA ramp           (transit_lka.Ramp,           0-2)
-#   bit    6  Transit LKA direction sign (transit_lka.DirectionSign,  0-1)
+#   bits 2-3  Transit LKA intervention   (TransitLkaIntervention,   0-2)
+#   bits 4-5  Transit LKA ramp           (TransitLkaRamp,           0-2)
+#   bit    6  Transit LKA direction sign (TransitLkaDirectionSign,  0-1)
 #   bits 7-31 free
 #
-# Pack and unpack live in transit_lka.py. Any new FordFlags member must take a free bit
-# from 7 upwards, never one of bits 2-6; test_transit_lka.TestFlagPacking guards that.
+# Any new FordFlags member must take a free bit from 7 upwards, never one of bits 2-6;
+# test_ford.TestTransitLkaFlagPacking guards that.
 TRANSIT_LKA_INTERVENTION_SHIFT = 2
 TRANSIT_LKA_INTERVENTION_MASK = 0b11 << TRANSIT_LKA_INTERVENTION_SHIFT      # 0x0C
 TRANSIT_LKA_RAMP_SHIFT = 4
@@ -77,6 +78,70 @@ TRANSIT_LKA_RAMP_MASK = 0b11 << TRANSIT_LKA_RAMP_SHIFT                      # 0x
 TRANSIT_LKA_DIRECTION_SIGN_SHIFT = 6
 TRANSIT_LKA_DIRECTION_SIGN_MASK = 0b1 << TRANSIT_LKA_DIRECTION_SIGN_SHIFT   # 0x40
 TRANSIT_LKA_FLAGS_MASK = TRANSIT_LKA_INTERVENTION_MASK | TRANSIT_LKA_RAMP_MASK | TRANSIT_LKA_DIRECTION_SIGN_MASK
+
+
+# All three switches are independent so each can be A/B tested on its own. The preset
+# thresholds they select come from 46,577 recorded commanded frames across four routes;
+# the state machine that applies them is TransitLkaState in ford/carcontroller.py.
+class TransitLkaIntervention(IntEnum):
+  STANDARD = 0
+  INCREASING = 1
+  PRESET = 2
+
+
+class TransitLkaRamp(IntEnum):
+  SLOW = 0
+  FAST = 1
+  PRESET = 2
+
+
+class TransitLkaDirectionSign(IntEnum):
+  POSITIVE_LEFT = 0
+  POSITIVE_RIGHT = 1
+
+
+def _coerce_transit_lka_setting(enum_cls: type[IntEnum], value: int) -> IntEnum:
+  """Coerce a Params-sourced switch to its enum, falling back to the default.
+
+  These three switches ship with no UI, so hand-editing the params is the only way to
+  use them and a typo is the expected interaction. A raised ValueError in
+  CarController.__init__ kills card, which manager then restarts forever, leaving the
+  device unusable until the param is corrected over SSH. Clamp instead, and say so.
+
+  Member 0 of each enum is the shipped default (STANDARD / SLOW / POSITIVE_LEFT), and
+  is also what unset (all-zero) flag bits already decode to.
+  """
+  try:
+    return enum_cls(value)
+  except ValueError:
+    default = enum_cls(0)
+    carlog.warning("transit lka: %s=%s is out of range, falling back to %s", enum_cls.__name__, value, default.name)
+    return default
+
+
+def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int) -> int:
+  """Pack the three switches into their CarParams.flags bits (layout above).
+
+  Clamping happens here as well as on unpack because direction sign only owns one bit:
+  a typo'd param would otherwise survive the round trip as a valid-looking
+  TransitLkaDirectionSign instead of falling back to the default. All-default settings
+  pack to 0, so ORing the result into a non-Ford CarParams.flags is a no-op.
+  """
+  return ((int(_coerce_transit_lka_setting(TransitLkaIntervention, intervention)) << TRANSIT_LKA_INTERVENTION_SHIFT) |
+          (int(_coerce_transit_lka_setting(TransitLkaRamp, ramp)) << TRANSIT_LKA_RAMP_SHIFT) |
+          (int(_coerce_transit_lka_setting(TransitLkaDirectionSign, direction_sign)) << TRANSIT_LKA_DIRECTION_SIGN_SHIFT))
+
+
+def unpack_transit_lka_flags(flags: int) -> tuple[TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign]:
+  """Unpack the three switches from CarParams.flags (layout above).
+
+  The two-bit fields can still hold 3, which is outside TransitLkaIntervention and
+  TransitLkaRamp, so the clamp runs here too rather than trusting whatever produced
+  the flags.
+  """
+  return (_coerce_transit_lka_setting(TransitLkaIntervention, (flags & TRANSIT_LKA_INTERVENTION_MASK) >> TRANSIT_LKA_INTERVENTION_SHIFT),
+          _coerce_transit_lka_setting(TransitLkaRamp, (flags & TRANSIT_LKA_RAMP_MASK) >> TRANSIT_LKA_RAMP_SHIFT),
+          _coerce_transit_lka_setting(TransitLkaDirectionSign, (flags & TRANSIT_LKA_DIRECTION_SIGN_MASK) >> TRANSIT_LKA_DIRECTION_SIGN_SHIFT))
 
 
 class RADAR:

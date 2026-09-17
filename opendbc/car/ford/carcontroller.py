@@ -4,8 +4,8 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.transit_lka import TransitLkaState, unpack_flags
-from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
+from opendbc.car.ford.values import (CarControllerParams, FordFlags, CAR, TransitLkaDirectionSign,
+                                     TransitLkaIntervention, TransitLkaRamp, unpack_transit_lka_flags)
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -59,6 +59,82 @@ def apply_creep_compensation(accel: float, v_ego: float) -> float:
   return float(accel)
 
 
+# LkaActvStats_D2_Req values, keyed by (direction sign, escalated):
+#   1 IncrLeft, 2 StandLeft, 4 StandRight, 6 IncrRight
+TRANSIT_LKA_ACTION = {
+  (TransitLkaDirectionSign.POSITIVE_LEFT, False): (2, 4),
+  (TransitLkaDirectionSign.POSITIVE_LEFT, True): (1, 6),
+  (TransitLkaDirectionSign.POSITIVE_RIGHT, False): (4, 2),
+  (TransitLkaDirectionSign.POSITIVE_RIGHT, True): (6, 1),
+}
+
+
+class TransitLkaState:
+  """Picks LkaActvStats_D2_Req and LaRampType_B_Req for each Lane_Assist_Data1 frame.
+
+  Which of the two switchable behaviours is live comes from CarParams.flags; the PRESET
+  position of each runs the hysteresis below, whose thresholds come from 46,577 recorded
+  commanded frames across four routes.
+  """
+  DT = 1.0 / 33.0                 # Lane_Assist_Data1 is sent at 33Hz
+  DEADBAND_DEG = 0.1              # below this the wheel counts as centred
+
+  INTERV_ENTER_REQ = 5.0
+  INTERV_ENTER_DESIRED = 5.2
+  INTERV_EXIT_REQ = 4.6
+  INTERV_EXIT_DESIRED = 4.8
+
+  RAMP_ENTER_REQ = 1.8
+  RAMP_ENTER_RATE = 15.0
+  RAMP_EXIT_REQ = 1.5
+  RAMP_EXIT_RATE = 12.0
+  RAMP_RATE_TAU = 0.15            # raw demand rate chatters across the band
+
+  def __init__(self, intervention: TransitLkaIntervention, ramp: TransitLkaRamp, direction: TransitLkaDirectionSign):
+    self.intervention = intervention
+    self.ramp = ramp
+    self.direction = direction
+    self.increasing = False
+    self.fast = False
+    self.rate_filtered = 0.0
+
+  def reset(self) -> None:
+    self.increasing = False
+    self.fast = False
+    self.rate_filtered = 0.0
+
+  def update(self, req_deg: float, desired_deg: float, demand_rate_dps: float) -> tuple[int, int]:
+    req, desired = abs(req_deg), abs(desired_deg)
+
+    alpha = 1.0 - math.exp(-self.DT / self.RAMP_RATE_TAU)
+    self.rate_filtered += alpha * (abs(demand_rate_dps) - self.rate_filtered)
+
+    if self.intervention == TransitLkaIntervention.PRESET:
+      if req > self.INTERV_ENTER_REQ and desired >= self.INTERV_ENTER_DESIRED:
+        self.increasing = True
+      elif req < self.INTERV_EXIT_REQ and desired < self.INTERV_EXIT_DESIRED:
+        self.increasing = False
+    else:
+      self.increasing = self.intervention == TransitLkaIntervention.INCREASING
+
+    if self.ramp == TransitLkaRamp.PRESET:
+      if req >= self.RAMP_ENTER_REQ or self.rate_filtered >= self.RAMP_ENTER_RATE:
+        self.fast = True
+      elif req < self.RAMP_EXIT_REQ and self.rate_filtered < self.RAMP_EXIT_RATE:
+        self.fast = False
+    else:
+      self.fast = self.ramp == TransitLkaRamp.FAST
+
+    if req_deg > self.DEADBAND_DEG:
+      action = TRANSIT_LKA_ACTION[(self.direction, self.increasing)][0]
+    elif req_deg < -self.DEADBAND_DEG:
+      action = TRANSIT_LKA_ACTION[(self.direction, self.increasing)][1]
+    else:
+      action = 0
+
+    return action, int(self.fast)
+
+
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
     super().__init__(dbc_names, CP)
@@ -79,7 +155,7 @@ class CarController(CarControllerBase):
     self.transit_lka = None
     if CP.flags & FordFlags.LKA_STEER:
       # the three A/B switches ride in spare CarParams.flags bits; see ford/values.py
-      self.transit_lka = TransitLkaState(*unpack_flags(CP.flags))
+      self.transit_lka = TransitLkaState(*unpack_transit_lka_flags(CP.flags))
       self.desired_angle_last = 0.0
       self.lka_active_last = False
 
