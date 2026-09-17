@@ -2,7 +2,10 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.ford.fordcan import CanBus
-from opendbc.car.ford.values import CarControllerParams, DBC, FordFlags, TRANSIT_LKA_AVAIL_VALUES, unpack_transit_lka_flags
+from opendbc.car.ford.values import (CarControllerParams, DBC, FordFlags, TRANSIT_LKA_AVAIL_VALUES,
+                                     TRANSIT_LKA_CONT_ENTER_SPEED, TRANSIT_LKA_CONT_EXIT_SPEED_HIGH,
+                                     TRANSIT_LKA_CONT_EXIT_SPEED_LOW, TRANSIT_LKA_CRUISE_STANDBY,
+                                     TransitLkaContinuation, unpack_transit_lka_flags)
 from opendbc.car.interfaces import CarStateBase
 
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -22,6 +25,9 @@ class CarState(CarStateBase):
     self.lkas_available = False
     # Which LaActAvail_D_Actl values count as "LKA offered"; switchable, see values.py
     self.lkas_avail_values = TRANSIT_LKA_AVAIL_VALUES[unpack_transit_lka_flags(CP.flags)[3]]
+    self.lka_continuation_enabled = unpack_transit_lka_flags(CP.flags)[4] == TransitLkaContinuation.ON
+    self.lka_continuation = False
+    self.pcm_cruise_engaged_prev = False
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -69,7 +75,28 @@ class CarState(CarStateBase):
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False
     ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS)
-    ret.cruiseState.enabled = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (4, 5)
+    cruise_state = cp.vl["EngBrakeData"]["CcStat_D_Actl"]
+    pcm_cruise_engaged = cruise_state in (4, 5)
+
+    # Lateral continuation: the PCM leaves Active for Standby at about 17.8 km/h and
+    # every command stops, lateral included, even though lateral never goes through the
+    # PCM. Latch on that transition so Lane_Assist_Data1 keeps flowing below it - the
+    # only way to exercise the PSCM down there. Panda recomputes the same latch from the
+    # same three signals (safety/modes/ford.h); the thresholds and conditions are
+    # duplicated there and must stay identical, or one side commands while the other
+    # blocks. vEgoRaw, not vEgo, because panda reads Veh_V_ActlBrk unfiltered.
+    standby = cruise_state == TRANSIT_LKA_CRUISE_STANDBY
+    if not self.lka_continuation:
+      self.lka_continuation = (self.lka_continuation_enabled and self.pcm_cruise_engaged_prev and standby and
+                               ret.vEgoRaw < TRANSIT_LKA_CONT_ENTER_SPEED and not ret.brakePressed)
+    else:
+      self.lka_continuation = (standby and not ret.brakePressed and
+                               TRANSIT_LKA_CONT_EXIT_SPEED_LOW < ret.vEgoRaw < TRANSIT_LKA_CONT_EXIT_SPEED_HIGH)
+    self.pcm_cruise_engaged_prev = pcm_cruise_engaged
+
+    # Holding enabled through the latch is what keeps selfdriveState active, and with it
+    # latActive - openpilot has no lateral-only engagement state to fall back on.
+    ret.cruiseState.enabled = pcm_cruise_engaged or self.lka_continuation
     ret.cruiseState.available = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (3, 4, 5)
     ret.cruiseState.nonAdaptive = cp.vl["Cluster_Info1_FD1"]["AccEnbl_B_RqDrv"] == 0
     ret.cruiseState.standstill = cp.vl["EngBrakeData"]["AccStopMde_D_Rq"] == 3

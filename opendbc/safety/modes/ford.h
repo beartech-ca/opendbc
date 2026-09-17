@@ -26,6 +26,28 @@
 // ignores LCA/TJA on these) instead of the LCA/TJA curvature channel.
 static bool ford_lka_steer = false;
 
+// Lateral continuation. The PCM leaves CcStat_D_Actl Active for Standby at about
+// 4.94 m/s on the way to a stop, pcm_cruise_check drops controls_allowed, and every
+// command stops - lateral included, although lateral is a PSCM channel the PCM has no
+// part in. When enabled, a latch taken on that exact transition keeps
+// Lane_Assist_Data1 permitted below it, and nothing else: ACCDATA, the cruise buttons
+// and LateralMotionControl all keep gating on controls_allowed alone, so openpilot
+// cannot accelerate or brake while the driver's cruise reads Standby.
+//
+// The latch is recomputed here rather than trusted from openpilot, and CarState runs
+// the identical conditions off the identical signals (opendbc/car/ford/carstate.py and
+// the TRANSIT_LKA_CONT_* constants in ford/values.py). The two must stay in step: if
+// openpilot latches where panda does not, every steering frame becomes a TX violation.
+static bool ford_lka_continuation_enabled = false;
+static bool ford_lka_continuation = false;
+// m/s, off Veh_V_ActlBrk. Entry sits above the cancel and below normal driving; the
+// exit band is wide enough to absorb openpilot filtering the same signal. The low exit
+// is under the 1.0 m/s the PSCM calibration claims, so it cannot mask that.
+#define FORD_LKA_CONT_ENTER_SPEED     7.0f
+#define FORD_LKA_CONT_EXIT_SPEED_HIGH 9.0f
+#define FORD_LKA_CONT_EXIT_SPEED_LOW  0.5f
+#define FORD_CRUISE_STANDBY           3U
+
 static uint8_t ford_get_counter(const CANPacket_t *msg) {
   uint8_t cnt = 0;
   if (msg->addr == FORD_BrakeSysFeatures) {
@@ -176,6 +198,23 @@ static void ford_rx_hook(const CANPacket_t *msg) {
       // Signal: CcStat_D_Actl
       unsigned int cruise_state = msg->data[1] & 0x07U;
       bool cruise_engaged = (cruise_state == 4U) || (cruise_state == 5U);
+
+      // Lateral continuation latch. Evaluated before pcm_cruise_check, which is what
+      // consumes and then overwrites cruise_engaged_prev: entry needs the state from
+      // the frame before, so that the latch can only be taken on the Active -> Standby
+      // transition and never from a standing start in Standby (cruise switched on but
+      // never set). Speed is the unfiltered Veh_V_ActlBrk sample, matching CarState.
+      const float ford_speed = ((float)vehicle_speed.values[0]) / VEHICLE_SPEED_FACTOR;
+      const bool ford_standby = cruise_state == FORD_CRUISE_STANDBY;
+      if (!ford_lka_continuation) {
+        ford_lka_continuation = ford_lka_continuation_enabled && cruise_engaged_prev && ford_standby &&
+                                (ford_speed < FORD_LKA_CONT_ENTER_SPEED) && !brake_pressed;
+      } else {
+        ford_lka_continuation = ford_standby && !brake_pressed &&
+                                (ford_speed > FORD_LKA_CONT_EXIT_SPEED_LOW) &&
+                                (ford_speed < FORD_LKA_CONT_EXIT_SPEED_HIGH);
+      }
+
       pcm_cruise_check(cruise_engaged);
     }
   }
@@ -308,9 +347,14 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
         rel_tenths = 0;
       }
 
+      // The only place the continuation latch is consulted. Every other branch of this
+      // hook keeps gating on controls_allowed alone, which is what confines the latch
+      // to lateral: it can never permit an ACCDATA or cruise-button transmission.
+      const bool lat_allowed = controls_allowed || ford_lka_continuation;
+
       bool violation = false;
 
-      if (controls_allowed && steer_control_enabled) {
+      if (lat_allowed && steer_control_enabled) {
         // *** relative request magnitude limit ***
         // The signal encoding already bounds this on the car side; the bound is repeated
         // here to catch panda's own bit extraction of LaRefAng_No_Req being wrong, a class
@@ -339,7 +383,7 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
       }
 
       // No steering request allowed when lateral control is not allowed
-      violation |= !controls_allowed && steer_control_enabled;
+      violation |= !lat_allowed && steer_control_enabled;
 
       violation |= !valid_action;
 
@@ -478,6 +522,13 @@ static safety_config ford_init(uint16_t param) {
 
   const uint16_t FORD_PARAM_LKA_STEER = 4;
   ford_lka_steer = GET_FLAG(param, FORD_PARAM_LKA_STEER);
+
+  // Lateral continuation, and only on a platform that steers through Lane_Assist_Data1
+  // in the first place - it permits nothing anywhere else. The latch itself always
+  // starts clear, so a mode change cannot inherit one taken before it.
+  const uint16_t FORD_PARAM_LKA_CONTINUATION = 8;
+  ford_lka_continuation_enabled = ford_lka_steer && GET_FLAG(param, FORD_PARAM_LKA_CONTINUATION);
+  ford_lka_continuation = false;
 
   bool ford_longitudinal = false;
 

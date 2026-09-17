@@ -16,9 +16,11 @@ from opendbc.car.ford.carcontroller import CarController, TransitLkaState
 from opendbc.car.ford.carstate import CarState
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.values import (CAR, DBC, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes, FordFlags,
-                                     FordSafetyFlags, TRANSIT_LKA_AVAIL_VALUES, TRANSIT_LKA_FLAGS_MASK,
-                                     TransitLkaAvailGate, TransitLkaDirectionSign, TransitLkaIntervention,
-                                     TransitLkaRamp, pack_transit_lka_flags, unpack_transit_lka_flags)
+                                     FordSafetyFlags, TRANSIT_LKA_AVAIL_VALUES, TRANSIT_LKA_CONT_ENTER_SPEED,
+                                     TRANSIT_LKA_CONT_EXIT_SPEED_HIGH, TRANSIT_LKA_CONT_EXIT_SPEED_LOW,
+                                     TRANSIT_LKA_FLAGS_MASK, TransitLkaAvailGate, TransitLkaContinuation,
+                                     TransitLkaDirectionSign, TransitLkaIntervention, TransitLkaRamp,
+                                     pack_transit_lka_flags, unpack_transit_lka_flags)
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
 
@@ -524,42 +526,44 @@ class TestTransitLkaSettingsClamp:
 
 
 class TestTransitLkaFlagPacking:
-  """The three switches live in spare bits of upstream's CarParams.flags.
+  """The five switches live in spare bits of upstream's CarParams.flags.
 
   That keeps this fork's car.capnp byte-identical to upstream - no ordinal to collide on
   a rebase, no chance of decoding recorded logs against a different upstream @78 - at the
   cost of readability, so the layout in ford/values.py has to be exactly right. These
-  tests are what stops a later FordFlags member from silently landing on bits 2-6.
+  tests are what stops a later FordFlags member from silently landing on bits 2-9.
   """
 
   @staticmethod
   def _all_settings():
-    return itertools.product(TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign, TransitLkaAvailGate)
+    return itertools.product(TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign,
+                             TransitLkaAvailGate, TransitLkaContinuation)
 
   def test_every_combination_round_trips(self):
-    for intervention, ramp, direction, gate in self._all_settings():
-      flags = pack_transit_lka_flags(int(intervention), int(ramp), int(direction), int(gate))
-      assert unpack_transit_lka_flags(flags) == (intervention, ramp, direction, gate), f"{intervention}/{ramp}/{direction}/{gate}"
+    for combo in self._all_settings():
+      flags = pack_transit_lka_flags(*(int(s) for s in combo))
+      assert unpack_transit_lka_flags(flags) == combo, f"{combo}"
 
   def test_no_combination_disturbs_canfd_or_lka_steer(self):
     static = FordFlags.CANFD | FordFlags.LKA_STEER
-    for intervention, ramp, direction, gate in self._all_settings():
-      flags = pack_transit_lka_flags(int(intervention), int(ramp), int(direction), int(gate))
+    for combo in self._all_settings():
+      flags = pack_transit_lka_flags(*(int(s) for s in combo))
       # the packed bits never touch the two static flags, in either direction
-      assert flags & static == 0, f"{intervention}/{ramp}/{direction}/{gate} collides with {static!r}"
+      assert flags & static == 0, f"{combo} collides with {static!r}"
       for platform_flags in (0, FordFlags.CANFD, FordFlags.LKA_STEER, static):
         combined = platform_flags | flags
         assert combined & static == platform_flags
-        assert unpack_transit_lka_flags(combined) == (intervention, ramp, direction, gate)
+        assert unpack_transit_lka_flags(combined) == combo
 
   def test_defaults_pack_to_zero(self):
     # so that ORing card.py's value onto a non-Ford CarParams.flags is a no-op
     assert pack_transit_lka_flags(int(TransitLkaIntervention.STANDARD), int(TransitLkaRamp.SLOW),
-                                  int(TransitLkaDirectionSign.POSITIVE_LEFT), int(TransitLkaAvailGate.STANDARD)) == 0
+                                  int(TransitLkaDirectionSign.POSITIVE_LEFT), int(TransitLkaAvailGate.STANDARD),
+                                  int(TransitLkaContinuation.OFF)) == 0
 
   def test_layout_constants_agree_with_ford_flags(self):
     assert TRANSIT_LKA_FLAGS_MASK & (FordFlags.CANFD | FordFlags.LKA_STEER) == 0
-    assert TRANSIT_LKA_FLAGS_MASK == 0b111111100  # bits 2-8, as documented in values.py
+    assert TRANSIT_LKA_FLAGS_MASK == 0b1111111100  # bits 2-9, as documented in values.py
 
 
 class TestTransitLkaAvailGate:
@@ -622,3 +626,149 @@ class TestTransitLkaAvailGate:
     else:
       assert vals["LkaActvStats_D2_Req"] == 0
       assert vals["LaRefAng_No_Req"] == 0.0
+
+
+class TestTransitLkaContinuation:
+  """Keeping lateral alive past the PCM's cancel, and keeping longitudinal out of it.
+
+  The PCM leaves Active for Standby at about 4.94 m/s on the way to a stop. Without the
+  latch every command stops there, lateral included, so the PSCM is never asked to steer
+  below it and the min-speed calibration cannot be exercised at all.
+  """
+
+  ENGAGED, STANDBY, OFF = 5, 3, 0
+
+  @staticmethod
+  def _carstate(on):
+    CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
+                                 alpha_long=False, is_release=True, docs=False)
+    CP.flags |= pack_transit_lka_flags(0, 0, 0, 0, int(TransitLkaContinuation.ON if on else TransitLkaContinuation.OFF))
+    return CarState(CP)
+
+  @staticmethod
+  def _step(cs, cruise_state, speed, brake=False):
+    """One update of just the latch, driven by the three signals panda also reads."""
+    ret = structs.CarState()
+    ret.vEgoRaw = speed
+    ret.brakePressed = brake
+    pcm_engaged = cruise_state in (4, 5)
+    standby = cruise_state == 3
+    if not cs.lka_continuation:
+      cs.lka_continuation = (cs.lka_continuation_enabled and cs.pcm_cruise_engaged_prev and standby and
+                             ret.vEgoRaw < TRANSIT_LKA_CONT_ENTER_SPEED and not ret.brakePressed)
+    else:
+      cs.lka_continuation = (standby and not ret.brakePressed and
+                             TRANSIT_LKA_CONT_EXIT_SPEED_LOW < ret.vEgoRaw < TRANSIT_LKA_CONT_EXIT_SPEED_HIGH)
+    cs.pcm_cruise_engaged_prev = pcm_engaged
+    return pcm_engaged or cs.lka_continuation
+
+  def test_latches_on_the_cancel_and_holds_down_to_walking_pace(self):
+    cs = self._carstate(True)
+    assert self._step(cs, self.ENGAGED, 12.0)          # engaged, well above the cancel
+    assert self._step(cs, self.ENGAGED, 5.2)
+    assert self._step(cs, self.STANDBY, 4.9)           # the cancel -> latch
+    assert cs.lka_continuation
+    for v in (4.0, 3.0, 2.0, 1.0, 0.6):                # 1.0 m/s is the value under test
+      assert self._step(cs, self.STANDBY, v), f"dropped at {v} m/s"
+
+  def test_never_latches_from_a_standing_start_in_standby(self):
+    # Standby is also "cruise switched on but never set". Entry requires the previous
+    # frame to have been genuinely engaged, so that case must not latch.
+    cs = self._carstate(True)
+    for _ in range(5):
+      assert not self._step(cs, self.STANDBY, 3.0)
+    assert not cs.lka_continuation
+
+  def test_off_is_the_shipped_behaviour(self):
+    cs = self._carstate(False)
+    assert self._step(cs, self.ENGAGED, 6.0)
+    assert not self._step(cs, self.STANDBY, 4.5)
+    assert not cs.lka_continuation
+
+  @pytest.mark.parametrize(("what", "cruise_state", "speed", "brake"), [
+    ("brake pressed", STANDBY, 3.0, True),
+    ("back above the exit speed", STANDBY, 9.5, False),
+    ("cruise re-engaged", ENGAGED, 3.0, False),
+    ("cruise switched off", OFF, 3.0, False),
+    ("stopped", STANDBY, 0.2, False),
+  ])
+  def test_every_exit_condition_releases_the_latch(self, what, cruise_state, speed, brake):
+    cs = self._carstate(True)
+    self._step(cs, self.ENGAGED, 6.0)
+    self._step(cs, self.STANDBY, 4.5)
+    assert cs.lka_continuation, "precondition: latched"
+    self._step(cs, cruise_state, speed, brake)
+    assert not cs.lka_continuation, f"latch survived {what}"
+
+  def test_does_not_relatch_after_releasing(self):
+    # once released the only way back is a fresh Active -> Standby transition
+    cs = self._carstate(True)
+    self._step(cs, self.ENGAGED, 6.0)
+    self._step(cs, self.STANDBY, 4.5)
+    self._step(cs, self.STANDBY, 3.0, brake=True)
+    assert not cs.lka_continuation
+    for _ in range(5):
+      self._step(cs, self.STANDBY, 3.0)
+      assert not cs.lka_continuation
+
+  @staticmethod
+  def _accdata_while(latched, accel=-2.0):
+    """Run the real controller and return what ACCDATA (0x186) actually carried."""
+    CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
+                                 alpha_long=False, is_release=True, docs=False)
+    CP.flags |= pack_transit_lka_flags(0, 0, 0, 0, int(TransitLkaContinuation.ON))
+    assert CP.openpilotLongitudinalControl, "precondition: this platform runs openpilot long"
+    car_interface = CarInterface(CP)
+    car_interface.update([])
+    car_interface.CS.lka_continuation = latched
+
+    CC = structs.CarControl()
+    CC.enabled = True
+    CC.longActive = True
+    CC.actuators.accel = accel
+    CC = CC.as_reader()
+
+    parser = CANParser("ford_lincoln_base_pt", [], 0)
+    seen = []
+    for i in range(20):
+      _, can_sends = car_interface.apply(CC, i)
+      for addr, dat, _bus in can_sends:
+        if addr == 0x186:
+          parser.update([(0, [(addr, dat, 0)])])
+          seen.append(dict(parser.vl["ACCDATA"]))
+    assert seen, "ACCDATA was never sent"
+    return seen
+
+  def test_longitudinal_is_forced_inactive_while_latched(self):
+    """The whole reason for choosing lateral-only: no accel or brake request gets out.
+
+    Drives the real CarController rather than re-deriving its expression, and decodes
+    the frame it actually emitted.
+    """
+    latched = self._accdata_while(True)
+    for v in latched:
+      assert v["Cmbb_B_Enbl"] == 0, "ACC enabled while latched"
+      assert v["AccResumEnbl_B_Rq"] == 0
+      assert v["AccBrkPrchg_B_Rq"] == 0 and v["AccBrkDecel_B_Rq"] == 0, "brake actuation while latched"
+      # panda accepts exactly one AccBrkTot_A_Rq while controls_allowed is false, the
+      # inactive value; anything else makes the frame a transmit violation
+      assert abs(v["AccBrkTot_A_Rq"]) < 0.005, f"accel {v['AccBrkTot_A_Rq']} is not the inactive value"
+
+  def test_the_same_request_does_get_out_when_not_latched(self):
+    # proves the test above is not vacuous - the identical accel goes through normally
+    free = self._accdata_while(False)
+    assert any(v["AccBrkTot_A_Rq"] < -0.5 for v in free), "braking never requested unlatched"
+    assert any(v["Cmbb_B_Enbl"] == 1 for v in free)
+
+  def test_the_switch_reaches_the_safety_layer(self):
+    """Unlike the other four switches this one has to be in safetyParam, because panda
+    recomputes the latch itself. get_params cannot see it (car_helpers.get_car ORs the
+    flags on afterwards), so CarInterface.__init__ is what puts it there."""
+    for on, expected in ((False, False), (True, True)):
+      CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
+                                   alpha_long=False, is_release=True, docs=False)
+      assert not (CP.safetyConfigs[-1].safetyParam & FordSafetyFlags.LKA_CONTINUATION), "get_params must not set it"
+      CP.flags |= pack_transit_lka_flags(0, 0, 0, 0, int(on))
+      CarInterface(CP)
+      got = bool(CP.safetyConfigs[-1].safetyParam & FordSafetyFlags.LKA_CONTINUATION)
+      assert got is expected

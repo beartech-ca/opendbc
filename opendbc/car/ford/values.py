@@ -48,6 +48,7 @@ class FordSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   CANFD = 2
   LKA_STEER = 4
+  LKA_CONTINUATION = 8
 
 
 class FordFlags(IntFlag):
@@ -68,9 +69,10 @@ class FordFlags(IntFlag):
 #   bits 4-5  Transit LKA ramp           (TransitLkaRamp,           0-2)
 #   bit    6  Transit LKA direction sign (TransitLkaDirectionSign,  0-1)
 #   bits 7-8  Transit LKA availability gate (TransitLkaAvailGate,   0-2)
-#   bits 9-31 free
+#   bit    9  Transit LKA continuation      (TransitLkaContinuation, 0-1)
+#   bits 10-31 free
 #
-# Any new FordFlags member must take a free bit from 9 upwards, never one of bits 2-8;
+# Any new FordFlags member must take a free bit from 10 upwards, never one of bits 2-9;
 # test_ford.TestTransitLkaFlagPacking guards that.
 TRANSIT_LKA_INTERVENTION_SHIFT = 2
 TRANSIT_LKA_INTERVENTION_MASK = 0b11 << TRANSIT_LKA_INTERVENTION_SHIFT      # 0x0C
@@ -80,8 +82,11 @@ TRANSIT_LKA_DIRECTION_SIGN_SHIFT = 6
 TRANSIT_LKA_DIRECTION_SIGN_MASK = 0b1 << TRANSIT_LKA_DIRECTION_SIGN_SHIFT   # 0x40
 TRANSIT_LKA_AVAIL_GATE_SHIFT = 7
 TRANSIT_LKA_AVAIL_GATE_MASK = 0b11 << TRANSIT_LKA_AVAIL_GATE_SHIFT          # 0x180
+TRANSIT_LKA_CONTINUATION_SHIFT = 9
+TRANSIT_LKA_CONTINUATION_MASK = 0b1 << TRANSIT_LKA_CONTINUATION_SHIFT       # 0x200
 TRANSIT_LKA_FLAGS_MASK = (TRANSIT_LKA_INTERVENTION_MASK | TRANSIT_LKA_RAMP_MASK |
-                          TRANSIT_LKA_DIRECTION_SIGN_MASK | TRANSIT_LKA_AVAIL_GATE_MASK)
+                          TRANSIT_LKA_DIRECTION_SIGN_MASK | TRANSIT_LKA_AVAIL_GATE_MASK |
+                          TRANSIT_LKA_CONTINUATION_MASK)
 
 
 # All three switches are independent so each can be A/B tested on its own. The preset
@@ -121,6 +126,36 @@ class TransitLkaAvailGate(IntEnum):
   ANY = 2
 
 
+class TransitLkaContinuation(IntEnum):
+  """Keep steering after the PCM cancels cruise on the way down to a stop.
+
+  The PCM leaves Active for Standby at about 17.8 km/h, panda drops controls_allowed
+  and every command stops - lateral included, even though lateral never goes through
+  the PCM at all. ON latches a continuation from that transition so Lane_Assist_Data1
+  keeps flowing, which is the only way to exercise the PSCM below that speed.
+
+  Lateral only. Longitudinal stays blocked: panda still gates ACCDATA on
+  controls_allowed, and CarController forces it inactive while the latch is held, so
+  the van coasts exactly as it does today. The failure this rules out is openpilot
+  accelerating or braking while the driver's cruise reads Standby.
+  """
+  OFF = 0
+  ON = 1
+
+
+# Continuation latch thresholds, in m/s off BrakeSysFeatures.Veh_V_ActlBrk. Panda
+# recomputes the same latch from the same signal (safety/modes/ford.h); both sides must
+# agree or one commands while the other blocks, so these are duplicated there verbatim.
+# Entry sits above the ~4.94 m/s cancel and well below normal driving; the exit band is
+# wide enough that the two speed paths (openpilot filters, panda does not) cannot
+# disagree. The low exit is under the 1.0 m/s the calibration claims, so it does not
+# mask what this is meant to test.
+TRANSIT_LKA_CONT_ENTER_SPEED = 7.0   # 25.2 km/h
+TRANSIT_LKA_CONT_EXIT_SPEED_HIGH = 9.0   # 32.4 km/h
+TRANSIT_LKA_CONT_EXIT_SPEED_LOW = 0.5    # 1.8 km/h
+TRANSIT_LKA_CRUISE_STANDBY = 3           # CcStat_D_Actl
+
+
 # LaActAvail_D_Actl values each gate position treats as "LKA offered".
 TRANSIT_LKA_AVAIL_VALUES: dict[int, tuple[int, ...]] = {
   TransitLkaAvailGate.STANDARD: (2, 3),
@@ -148,7 +183,8 @@ def _coerce_transit_lka_setting(enum_cls: type[IntEnum], value: int) -> IntEnum:
     return default
 
 
-def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int, avail_gate: int = 0) -> int:
+def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int, avail_gate: int = 0,
+                           continuation: int = 0) -> int:
   """Pack the three switches into their CarParams.flags bits (layout above).
 
   Clamping happens here as well as on unpack because direction sign only owns one bit:
@@ -159,11 +195,12 @@ def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int, av
   return ((int(_coerce_transit_lka_setting(TransitLkaIntervention, intervention)) << TRANSIT_LKA_INTERVENTION_SHIFT) |
           (int(_coerce_transit_lka_setting(TransitLkaRamp, ramp)) << TRANSIT_LKA_RAMP_SHIFT) |
           (int(_coerce_transit_lka_setting(TransitLkaDirectionSign, direction_sign)) << TRANSIT_LKA_DIRECTION_SIGN_SHIFT) |
-          (int(_coerce_transit_lka_setting(TransitLkaAvailGate, avail_gate)) << TRANSIT_LKA_AVAIL_GATE_SHIFT))
+          (int(_coerce_transit_lka_setting(TransitLkaAvailGate, avail_gate)) << TRANSIT_LKA_AVAIL_GATE_SHIFT) |
+          (int(_coerce_transit_lka_setting(TransitLkaContinuation, continuation)) << TRANSIT_LKA_CONTINUATION_SHIFT))
 
 
-def unpack_transit_lka_flags(flags: int) -> tuple[TransitLkaIntervention, TransitLkaRamp,
-                                                  TransitLkaDirectionSign, TransitLkaAvailGate]:
+def unpack_transit_lka_flags(flags: int) -> tuple[TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign,
+                                                  TransitLkaAvailGate, TransitLkaContinuation]:
   """Unpack the three switches from CarParams.flags (layout above).
 
   The two-bit fields can still hold 3, which is outside TransitLkaIntervention,
@@ -173,7 +210,8 @@ def unpack_transit_lka_flags(flags: int) -> tuple[TransitLkaIntervention, Transi
   return (_coerce_transit_lka_setting(TransitLkaIntervention, (flags & TRANSIT_LKA_INTERVENTION_MASK) >> TRANSIT_LKA_INTERVENTION_SHIFT),
           _coerce_transit_lka_setting(TransitLkaRamp, (flags & TRANSIT_LKA_RAMP_MASK) >> TRANSIT_LKA_RAMP_SHIFT),
           _coerce_transit_lka_setting(TransitLkaDirectionSign, (flags & TRANSIT_LKA_DIRECTION_SIGN_MASK) >> TRANSIT_LKA_DIRECTION_SIGN_SHIFT),
-          _coerce_transit_lka_setting(TransitLkaAvailGate, (flags & TRANSIT_LKA_AVAIL_GATE_MASK) >> TRANSIT_LKA_AVAIL_GATE_SHIFT))
+          _coerce_transit_lka_setting(TransitLkaAvailGate, (flags & TRANSIT_LKA_AVAIL_GATE_MASK) >> TRANSIT_LKA_AVAIL_GATE_SHIFT),
+          _coerce_transit_lka_setting(TransitLkaContinuation, (flags & TRANSIT_LKA_CONTINUATION_MASK) >> TRANSIT_LKA_CONTINUATION_SHIFT))
 
 
 class RADAR:

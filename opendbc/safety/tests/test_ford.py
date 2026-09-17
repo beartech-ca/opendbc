@@ -1040,3 +1040,176 @@ class TestFordTransitReplay:
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestFordTransitLkaContinuation(TestFordTransitLkaSafety):
+  """Lateral continuation past the PCM's own cancel, exercised through the real hooks.
+
+  Everything here runs the safety C, not a re-derivation of it: the latch, the fact
+  that it reaches only Lane_Assist_Data1, and the exit conditions.
+  """
+  # Must match the FORD_LKA_CONT_* constants in ford.h
+  CONT_ENTER_SPEED = 7.0
+  CONT_EXIT_SPEED_HIGH = 9.0
+  CONT_EXIT_SPEED_LOW = 0.5
+  CRUISE_ACTIVE, CRUISE_STANDBY, CRUISE_OFF = 5, 3, 0
+
+  def setUp(self):
+    super().setUp()
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford,
+                                 FordSafetyFlags.LKA_STEER | FordSafetyFlags.LONG_CONTROL |
+                                 FordSafetyFlags.LKA_CONTINUATION)
+    self.safety.init_tests()
+    self.__class__.cnt_lka_cmd = 0
+    self.safety.set_timer(0)
+
+  # Same values TestFordLongitudinalSafetyBase uses; that class descends from the
+  # curvature-steering base, which this platform is not, so they are repeated rather
+  # than inherited.
+  MAX_ACCEL, INACTIVE_ACCEL = 2.0, 0.0
+  MAX_GAS, INACTIVE_GAS = 2.0, -5.0
+
+  def _acc_command_msg(self, gas: float, brake: float, brake_actuation: bool):
+    values = {
+      "AccPrpl_A_Rq": gas,
+      "AccPrpl_A_Pred": gas,
+      "AccBrkTot_A_Rq": brake,
+      "AccBrkPrchg_B_Rq": 1 if brake_actuation else 0,
+      "AccBrkDecel_B_Rq": 1 if brake_actuation else 0,
+    }
+    return self.packer.make_can_msg_safety("ACCDATA", 0, values)
+
+  def _cruise_msg(self, cruise_state: int, brake: bool = False):
+    values = {"BpedDrvAppl_D_Actl": 2 if brake else 1, "CcStat_D_Actl": cruise_state}
+    return self.packer.make_can_msg_safety("EngBrakeData", 0, values)
+
+  def _feed(self, cruise_state: int, speed: float, brake: bool = False):
+    for _ in range(6):  # sample_t window, so vehicle_speed.values[0] really is `speed`
+      self._rx(self._speed_msg(speed))
+    self._rx(self._cruise_msg(cruise_state, brake))
+
+  def _steers(self) -> bool:
+    self._reset_pinion_measurement(0.)
+    return self._tx(self._lka_angle_msg(2, 1.0))
+
+  def _decelerate_into_standby(self):
+    """Engage normally, then reproduce the PCM's Active -> Standby cancel at low speed."""
+    self._feed(self.CRUISE_ACTIVE, 12.0)
+    assert self.safety.get_controls_allowed()
+    self._feed(self.CRUISE_ACTIVE, 5.2)
+    self._feed(self.CRUISE_STANDBY, 4.5)
+    assert not self.safety.get_controls_allowed(), "the cancel must still drop controls_allowed"
+
+  def test_lka_survives_the_cancel(self):
+    self._decelerate_into_standby()
+    assert self._steers(), "steering blocked below the PCM cancel with continuation on"
+
+  def test_lka_still_steers_down_to_walking_pace(self):
+    self._decelerate_into_standby()
+    for speed in (4.0, 3.0, 2.0, 1.0, 0.6):
+      self._feed(self.CRUISE_STANDBY, speed)
+      assert self._steers(), f"steering blocked at {speed} m/s"
+
+  def test_longitudinal_never_follows(self):
+    """The point of lateral-only: ACCDATA and the cruise buttons stay blocked."""
+    self._decelerate_into_standby()
+    # a real braking request, which is what openpilot would still be producing
+    assert not self._tx(self._acc_command_msg(self.INACTIVE_GAS, self.MAX_ACCEL, True)), \
+      "brake actuation allowed during continuation"
+    assert not self._tx(self._acc_command_msg(self.MAX_GAS, self.INACTIVE_ACCEL, False)), \
+      "propulsion allowed during continuation"
+    assert not self._tx(self._acc_button_msg(Buttons.RESUME, 0)), "resume allowed during continuation"
+
+  def test_the_inactive_accdata_frame_is_still_accepted(self):
+    """Proves the block above is the safety layer working, not openpilot being cut off:
+    the inactive frame CarController actually emits while latched still goes out."""
+    self._decelerate_into_standby()
+    assert self._tx(self._acc_command_msg(self.INACTIVE_GAS, self.INACTIVE_ACCEL, False))
+
+  def test_lateral_motion_control_never_follows(self):
+    # 0x3D3 shares limiter state with the 0x3CA check and must stay an inactive
+    # heartbeat on this platform, continuation or not
+    self._decelerate_into_standby()
+    values = {"LatCtl_D_Rq": 1}
+    assert not self._tx(self.packer.make_can_msg_safety("LateralMotionControl", 0, values))
+
+  def test_does_not_arm_from_a_standing_start_in_standby(self):
+    # Standby is also "cruise switched on but never set" - entry needs the previous
+    # frame to have been genuinely engaged
+    for _ in range(5):
+      self._feed(self.CRUISE_STANDBY, 3.0)
+    assert not self._steers(), "latched without ever having been engaged"
+
+  def test_does_not_arm_when_the_cancel_happens_at_speed(self):
+    self._feed(self.CRUISE_ACTIVE, 20.0)
+    assert self.safety.get_controls_allowed()
+    self._feed(self.CRUISE_STANDBY, 20.0)  # above the entry threshold
+    assert not self._steers(), "latched on a cancel that was not the low-speed one"
+
+  def test_brake_releases_it(self):
+    self._decelerate_into_standby()
+    assert self._steers()
+    self._feed(self.CRUISE_STANDBY, 3.0, brake=True)
+    assert not self._steers(), "latch survived the driver braking"
+
+  def test_accelerating_away_releases_it(self):
+    self._decelerate_into_standby()
+    assert self._steers()
+    self._feed(self.CRUISE_STANDBY, self.CONT_EXIT_SPEED_HIGH + 1.0)
+    assert not self._steers(), "latch survived climbing back above the exit speed"
+
+  def test_stopping_releases_it(self):
+    self._decelerate_into_standby()
+    assert self._steers()
+    self._feed(self.CRUISE_STANDBY, 0.2)
+    assert not self._steers(), "latch survived coming to a stop"
+
+  def test_cruise_switched_off_releases_it(self):
+    self._decelerate_into_standby()
+    assert self._steers()
+    self._feed(self.CRUISE_OFF, 3.0)
+    assert not self._steers(), "latch survived cruise being switched off"
+
+  def test_does_not_relatch_once_released(self):
+    self._decelerate_into_standby()
+    self._feed(self.CRUISE_STANDBY, 3.0, brake=True)
+    assert not self._steers()
+    for _ in range(5):
+      self._feed(self.CRUISE_STANDBY, 3.0)
+      assert not self._steers(), "relatched without a fresh Active -> Standby transition"
+
+  def test_the_lateral_acceleration_bound_still_applies(self):
+    """Continuation permits the frame; it does not relax a single bound on it.
+
+    Uses the same construction as the bound's own test: put the measured pinion angle
+    one CAN unit either side of the model's ceiling and check both outcomes, so this
+    cannot pass by blocking everything.
+    """
+    speed = 4.5
+    max_angle_can = int(self._max_lka_angle_deg(speed) * self.LKA_DEG_TO_CAN) + 1
+    for angle_can, should_tx in ((max_angle_can, True), (max_angle_can + 1, False)):
+      self.setUp()
+      self._decelerate_into_standby()
+      self._feed(self.CRUISE_STANDBY, speed)
+      self._reset_pinion_measurement(angle_can / self.LKA_DEG_TO_CAN)
+      with self.subTest(angle_can=angle_can):
+        self.assertEqual(should_tx, self._tx(self._lka_angle_msg(2, 0.)))
+
+
+class TestFordTransitLkaContinuationOff(TestFordTransitLkaSafety):
+  """Without the flag, the shipped behaviour: the cancel stops lateral dead."""
+
+  def test_cancel_still_blocks_lka(self):
+    for _ in range(6):
+      self._rx(self._speed_msg(12.0))
+    self._rx(self._pcm_status_msg(True))
+    assert self.safety.get_controls_allowed()
+
+    for _ in range(6):
+      self._rx(self._speed_msg(4.5))
+    values = {"BpedDrvAppl_D_Actl": 1, "CcStat_D_Actl": 3}
+    self._rx(self.packer.make_can_msg_safety("EngBrakeData", 0, values))
+    assert not self.safety.get_controls_allowed()
+
+    self._reset_pinion_measurement(0.)
+    assert not self._tx(self._lka_angle_msg(2, 1.0)), "steering allowed with continuation off"

@@ -6,7 +6,8 @@ from opendbc.car.ford.carcontroller import CarController
 from opendbc.car.ford.carstate import CarState
 from opendbc.car.ford.fordcan import CanBus
 from opendbc.car.ford.radar_interface import RadarInterface
-from opendbc.car.ford.values import CAR, CarControllerParams, DBC, Ecu, FordFlags, RADAR, FordSafetyFlags
+from opendbc.car.ford.values import (CAR, CarControllerParams, DBC, Ecu, FordFlags, RADAR, FordSafetyFlags,
+                                     TransitLkaContinuation, unpack_transit_lka_flags)
 from opendbc.car.interfaces import CarInterfaceBase
 
 TransmissionType = structs.CarParams.TransmissionType
@@ -18,6 +19,17 @@ class CarInterface(CarInterfaceBase):
   RadarInterface = RadarInterface
 
   DRIVABLE_GEARS = (structs.CarState.GearShifter.low, structs.CarState.GearShifter.manumatic)
+
+  def __init__(self, CP):
+    # The A/B switches live in spare CarParams.flags bits, and car_helpers.get_car ORs
+    # them on *after* get_params has already built safetyConfigs, so get_params cannot
+    # see them. This is the first point holding both the switch and a still-mutable
+    # CarParams, and CP here is the same builder card.py later hands to pandad.
+    # Only continuation has to reach the safety layer; the other four switches are read
+    # straight from CP.flags by CarController and CarState.
+    if unpack_transit_lka_flags(CP.flags)[4] == TransitLkaContinuation.ON:
+      CP.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LKA_CONTINUATION.value
+    super().__init__(CP)
 
   @staticmethod
   def get_pid_accel_limits(CP, current_speed, cruise_speed):

@@ -248,10 +248,25 @@ class CarController(CarControllerBase):
     ### longitudinal control ###
     # send acc msg at 50Hz
     if self.CP.openpilotLongitudinalControl and (self.frame % CarControllerParams.ACC_CONTROL_STEP) == 0:
+      # The lateral continuation latch holds openpilot engaged past the PCM's own cancel
+      # so it can keep steering. It must not keep asking for acceleration or braking
+      # there: the PCM reads Standby, panda still gates ACCDATA on controls_allowed, and
+      # a request that did land would move the van while the driver's cruise reads off.
+      long_active = CC.longActive and not CS.lka_continuation
+
       accel = actuators.accel
       gas = accel
 
-      if CC.longActive:
+      if CS.lka_continuation:
+        # openpilot is still engaged through the latch, so the longitudinal controller
+        # keeps producing a real accel. controls_allowed is false at panda, where
+        # longitudinal_accel_checks then accepts exactly one value - inactive_accel -
+        # and blocks everything else. AccBrkTot_A_Rq is 0.0039/-20, so 0.0 m/s^2 is the
+        # request that encodes to it. Without this every ACCDATA frame is a violation.
+        accel = 0.0
+        gas = 0.0
+
+      if long_active:
         # Compensate for engine creep at low speed.
         # Either the ABS does not account for engine creep, or the correction is very slow
         # TODO: verify this applies to EV/hybrid
@@ -265,7 +280,7 @@ class CarController(CarControllerBase):
       gas = float(np.clip(gas, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
 
       # Both gas and accel are in m/s^2, accel is used solely for braking
-      if not CC.longActive or gas < CarControllerParams.MIN_GAS:
+      if not long_active or gas < CarControllerParams.MIN_GAS:
         gas = CarControllerParams.INACTIVE_GAS
 
       # PCM applies pitch compensation to gas/accel, but we need to compensate for the brake/pre-charge bits
@@ -274,14 +289,14 @@ class CarController(CarControllerBase):
         accel_due_to_pitch = math.sin(CC.orientationNED[1]) * ACCELERATION_DUE_TO_GRAVITY
 
       accel_pitch_compensated = accel + accel_due_to_pitch
-      if accel_pitch_compensated > 0.3 or not CC.longActive:
+      if accel_pitch_compensated > 0.3 or not long_active:
         self.brake_request = False
       elif accel_pitch_compensated < 0.0:
         self.brake_request = True
 
       stopping = CC.actuators.longControlState == LongCtrlState.stopping
       # TODO: look into using the actuators packet to send the desired speed
-      can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, CC.longActive, gas, accel, stopping, self.brake_request, v_ego_kph=V_CRUISE_MAX))
+      can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, long_active, gas, accel, stopping, self.brake_request, v_ego_kph=V_CRUISE_MAX))
 
       self.accel = accel
       self.gas = gas
