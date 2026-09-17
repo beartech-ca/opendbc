@@ -40,12 +40,28 @@ LKA_MAX_ANGLE_DEG = 5.8      # LaRefAng_No_Req saturates at +-102.4 mrad
 LKA_MAX_ANGLE_MRAD = 102.3
 
 
-def create_lka_msg(packer, CAN: CanBus, lat_active: bool = False, apply_angle_deg: float = 0.0,
-                   action: int = 0, ramp_type: int = 0):
+def create_lka_msg(packer, CAN: CanBus):
   """
-  Creates a CAN message for the Ford LKA Command.
+  Creates an empty CAN message for the Ford LKA Command.
 
-  On platforms whose PSCM ignores LCA/TJA this is the steering channel.
+  This command can apply "Lane Keeping Aid" maneuvers, which are subject to the PSCM lockout.
+
+  Frequency is 33Hz.
+  """
+
+  return packer.make_can_msg("Lane_Assist_Data1", CAN.main, {})
+
+
+def create_transit_lka_msg(packer, CAN: CanBus, lat_active: bool = False, apply_angle_deg: float = 0.0,
+                           action: int = 0, ramp_type: int = 0):
+  """
+  Creates a CAN message for the Ford LKA Command on LKA_STEER platforms.
+
+  On platforms whose PSCM ignores LCA/TJA this is the steering channel, so unlike
+  create_lka_msg above the frame carries real signal values. It is deliberately a
+  separate function: create_lka_msg is the empty lane-departure-warning frame every
+  other Ford platform transmits, and it must stay byte-for-byte empty on those.
+
   `apply_angle_deg` is RELATIVE to the current wheel angle and saturates at
   +-5.8 deg. `action` is LkaActvStats_D2_Req (2/4 standard, 1/6 increasing,
   0 inactive); `ramp_type` is LaRampType_B_Req (0 slow, 1 fast).

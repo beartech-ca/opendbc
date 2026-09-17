@@ -162,7 +162,7 @@ class TestTransitFingerprint(unittest.TestCase):
   def test_recorded_firmware_is_listed(self):
     listed = FW_VERSIONS[CAR.FORD_TRANSIT_MK5]
     flat = {}
-    for (_ecu, addr, sub), versions in listed.items():
+    for (_ecu, addr, _sub), versions in listed.items():
       flat.setdefault(addr, []).extend(versions)
     assert set(flat) == {addr for addr, _sub in self.RECORDED}, "unexpected set of ECU addresses"
     for (addr, _sub), fw in self.RECORDED.items():
@@ -254,7 +254,7 @@ class TestTransitLkaMessage:
     return parser.vl["Lane_Assist_Data1"]
 
   def test_inactive_sends_zero_action(self):
-    addr, dat, bus = fordcan.create_lka_msg(self.packer, self.CAN, False, 3.0, 4, 1)
+    addr, dat, bus = fordcan.create_transit_lka_msg(self.packer, self.CAN, False, 3.0, 4, 1)
     assert addr == 0x3CA
     assert (dat[0] >> 5) == 0
 
@@ -267,15 +267,15 @@ class TestTransitLkaMessage:
     assert vals["LaRefAng_No_Req"] == 0.0
 
   def test_active_sends_requested_action(self):
-    addr, dat, _bus = fordcan.create_lka_msg(self.packer, self.CAN, True, 3.0, 4, 1)
+    addr, dat, _bus = fordcan.create_transit_lka_msg(self.packer, self.CAN, True, 3.0, 4, 1)
     assert (dat[0] >> 5) == 4
 
     vals = self._decode_lane_assist_data1(addr, dat)
     assert vals["LkaActvStats_D2_Req"] == 4
 
   def test_angle_is_clipped_to_the_wire_limit(self):
-    addr, hi, _b = fordcan.create_lka_msg(self.packer, self.CAN, True, 99.0, 2, 0)
-    _a, cap, _b = fordcan.create_lka_msg(self.packer, self.CAN, True, 5.8, 2, 0)
+    addr, hi, _b = fordcan.create_transit_lka_msg(self.packer, self.CAN, True, 99.0, 2, 0)
+    _a, cap, _b = fordcan.create_transit_lka_msg(self.packer, self.CAN, True, 5.8, 2, 0)
     assert hi == cap
 
     # The identity check above would still pass if clipping were broken in a

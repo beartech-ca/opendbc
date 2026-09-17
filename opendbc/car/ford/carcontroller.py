@@ -4,7 +4,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.transit_lka import TransitLkaState, Intervention, Ramp, DirectionSign
+from opendbc.car.ford.transit_lka import TransitLkaState, Intervention, Ramp, DirectionSign, coerce_setting
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -78,9 +78,9 @@ class CarController(CarControllerBase):
 
     self.transit_lka = None
     if CP.flags & FordFlags.LKA_STEER:
-      self.transit_lka = TransitLkaState(Intervention(CP.transitLka.intervention),
-                                         Ramp(CP.transitLka.ramp),
-                                         DirectionSign(CP.transitLka.directionSign))
+      self.transit_lka = TransitLkaState(coerce_setting(Intervention, CP.transitLka.intervention),
+                                         coerce_setting(Ramp, CP.transitLka.ramp),
+                                         coerce_setting(DirectionSign, CP.transitLka.directionSign))
       self.desired_angle_last = 0.0
       self.lka_active_last = False
 
@@ -164,8 +164,8 @@ class CarController(CarControllerBase):
           self.transit_lka.reset()
         self.desired_angle_last = actuators.steeringAngleDeg
         self.lka_active_last = lka_active
-        can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN, lka_active,
-                                                apply_angle, action, ramp_type))
+        can_sends.append(fordcan.create_transit_lka_msg(self.packer, self.CAN, lka_active,
+                                                        apply_angle, action, ramp_type))
     elif (self.frame % CarControllerParams.LKA_STEP) == 0:
       can_sends.append(fordcan.create_lka_msg(self.packer, self.CAN))
 

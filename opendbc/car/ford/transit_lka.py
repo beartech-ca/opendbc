@@ -7,6 +7,8 @@ docs/superpowers/specs/2026-09-16-transit-mk5-lka-port-design.md.
 import math
 from enum import IntEnum
 
+from opendbc.car.carlog import carlog
+
 DT = 1.0 / 33.0                 # Lane_Assist_Data1 is sent at 33Hz
 DEADBAND_DEG = 0.1              # below this the wheel counts as centred
 
@@ -37,6 +39,26 @@ class Ramp(IntEnum):
 class DirectionSign(IntEnum):
   POSITIVE_LEFT = 0
   POSITIVE_RIGHT = 1
+
+
+def coerce_setting(enum_cls: type[IntEnum], value: int) -> IntEnum:
+  """Coerce a Params-sourced switch to its enum, falling back to the default.
+
+  These three switches ship with no UI, so hand-editing the params is the only way to
+  use them and a typo is the expected interaction. The capnp fields are UInt8, so an
+  out-of-range value stores fine and only fails here - and a raised ValueError in
+  CarController.__init__ kills card, which manager then restarts forever, leaving the
+  device unusable until the param is corrected over SSH. Clamp instead, and say so.
+
+  Member 0 of each enum is the shipped default (STANDARD / SLOW / POSITIVE_LEFT), and
+  is also what an unset capnp UInt8 already decodes to.
+  """
+  try:
+    return enum_cls(value)
+  except ValueError:
+    default = enum_cls(0)
+    carlog.warning("transitLka: %s=%s is out of range, falling back to %s", enum_cls.__name__, value, default.name)
+    return default
 
 
 # LkaActvStats_D2_Req: 1 IncrLeft, 2 StandLeft, 4 StandRight, 6 IncrRight

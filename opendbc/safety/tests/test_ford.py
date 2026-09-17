@@ -3,6 +3,7 @@ import math
 import numpy as np
 import pathlib
 import random
+import re
 import unittest
 
 import opendbc.safety.tests.common as common
@@ -530,6 +531,8 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
   FWD_BLACKLISTED_ADDRS = {2: [MSG_ACCDATA, MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl,
                                MSG_IPMA_Data]}
 
+  cnt_lka_cmd = 0
+
   def setUp(self):
     self.packer = CANPackerSafety("ford_lincoln_base_pt")
     self.safety = libsafety_py.libsafety
@@ -537,9 +540,14 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
     # since FORD_TRANSIT_MK5 has a radar and is not CAN FD.
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LKA_STEER | FordSafetyFlags.LONG_CONTROL)
     self.safety.init_tests()
+    # The LKA command is subject to a real time send-rate limit, so the mock clock has
+    # to advance across the frames a test sends, exactly as onboard time would.
+    self.__class__.cnt_lka_cmd = 0
+    self.safety.set_timer(0)
 
   # Must match the FORD_LKA_* constants and FORD_LKA_STEERING_PARAMS in ford.h
   LKA_DEG_TO_CAN = 10
+  LKA_FREQUENCY = 33  # Hz, must match FORD_LKA_RT_LIMITS.frequency
   LKA_SLIP_FACTOR = -0.0004472752575630534
   LKA_STEER_RATIO = 20.9
   LKA_WHEELBASE = 3.75
@@ -587,17 +595,24 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
       self._rx(self._speed_msg(speed))
       self._rx(self._speed_msg_2(speed))
 
-  # LKA command: action + angle relative to the current pinion angle
-  def _lka_angle_msg(self, action: int, relative_mrad: float):
+  # LKA command: action + angle relative to the current pinion angle.
+  # Advances the mock clock one 33Hz frame per command by default, the way the real
+  # onboard clock does; pass increment_timer=False to exercise the real time rate limit.
+  def _lka_angle_msg(self, action: int, relative_mrad: float, increment_timer: bool = True):
     values = {
       "LkaActvStats_D2_Req": action,
       "LaRefAng_No_Req": relative_mrad,
     }
+    if increment_timer:
+      self.safety.set_timer(self.cnt_lka_cmd * int(1e6 / self.LKA_FREQUENCY))
+      self.__class__.cnt_lka_cmd += 1
     return self.packer.make_can_msg_safety("Lane_Assist_Data1", 0, values)
 
   def _lka_heartbeat_msg(self):
-    # The frame openpilot actually sends when it is not steering: fordcan.create_lka_msg
-    # packs an all-zero payload, and raw zero in LaRefAng_No_Req is -102.4 mrad, not 0.
+    # The worst case the safety has to accept when nothing is steering: an all-zero
+    # payload, in which raw zero in LaRefAng_No_Req decodes to -102.4 mrad, not 0. It is
+    # what fordcan.create_lka_msg sends on every other Ford platform; the Transit's own
+    # inactive frame (create_transit_lka_msg) packs the value 0.0 explicitly instead.
     return self.packer.make_can_msg_safety("Lane_Assist_Data1", 0, {})
 
   # LCA/TJA message. The PSCM ignores it on this platform, but openpilot still sends it
@@ -681,7 +696,7 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
     self.safety.set_controls_allowed(1)
     self._reset_speed_measurement(0.)
     self._reset_pinion_measurement(0.)
-    for raw in range(0, 4096):
+    for raw in range(4096):
       mrad = self.LKA_REL_ANGLE_MIN_MRAD + (raw * 0.05)
       with self.subTest(raw=raw):
         self.assertTrue(self._tx(self._lka_angle_msg(2, mrad)))
@@ -689,16 +704,20 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
         self.assertLessEqual(abs(rel_can), self.LKA_MAX_REL_ANGLE_CAN)
 
   def test_relative_request_magnitude_bound_is_present(self):
-    # BOUND 1, continued. The bound sits exactly at the ceiling of the signal's own
-    # encoding, so no CAN frame can reach it while the extraction is correct: it is
-    # unreachable defence in depth against the extraction itself being wrong, and no
-    # behavioural test can therefore fail on its deletion. What can be pinned is that it
-    # is still there, which is the risk a check nothing exercises actually carries.
-    # test_neighbouring_signal_does_not_move_the_request covers the extraction it guards.
+    """BOUND 1, continued: the bound is still in the source.
+
+    The bound sits exactly at the ceiling of the signal's own encoding, so no CAN frame
+    can reach it while the extraction is correct: it is unreachable defence in depth
+    against the extraction itself being wrong, and no behavioural test can therefore fail
+    on its deletion. What can be pinned is that it is still there, which is the risk a
+    check nothing exercises actually carries. The behavioural coverage of the defect it
+    guards lives in test_neighbouring_signal_does_not_move_the_request; this is only a
+    presence check, matched loosely so ordinary reformatting of ford.h does not break it.
+    """
     ford_h = (pathlib.Path(__file__).parents[1] / "modes" / "ford.h").read_text()
-    self.assertIn(f"const int FORD_LKA_MAX_REL_ANGLE = {self.LKA_MAX_REL_ANGLE_CAN};", ford_h)
-    self.assertIn("violation |= safety_max_limit_check(rel_tenths, FORD_LKA_MAX_REL_ANGLE, "
-                  "-FORD_LKA_MAX_REL_ANGLE);", ford_h)
+    constant = rf"FORD_LKA_MAX_REL_ANGLE\s*=\s*{self.LKA_MAX_REL_ANGLE_CAN}\s*;"
+    check = r"safety_max_limit_check\(\s*rel_tenths\s*,\s*FORD_LKA_MAX_REL_ANGLE\s*,\s*-\s*FORD_LKA_MAX_REL_ANGLE\s*\)"
+    self.assertRegex(ford_h, re.compile(constant + ".*" + check, re.DOTALL))
 
   def test_neighbouring_signal_does_not_move_the_request(self):
     # BOUND 1's failure mode. LaCurvature_No_Calc (15|12@0+) shares byte 2 with
@@ -730,6 +749,35 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
     for i in range(20):
       mrad = self.LKA_REL_ANGLE_MAX_MRAD if (i % 2) == 0 else self.LKA_REL_ANGLE_MIN_MRAD
       self.assertTrue(self._tx(self._lka_angle_msg(2, mrad)), f"frame {i} blocked")
+
+  def test_command_send_rate_is_bounded(self):
+    # There is no per-frame rate-of-change bound (above), and the reason the two
+    # remaining bounds are enough is that the PSCM's own ramp bounds the wheel motion a
+    # single relative request can produce - and that ramp was measured against a 33Hz
+    # command stream. A device-side fault emitting 0x3CA far faster would hand the PSCM
+    # many times the correction per unit time with every individual frame still inside
+    # both bounds, so the number of commands per RT interval is capped as well.
+    self.safety.set_timer(0)
+    self.safety.set_controls_allowed(1)
+    self._reset_speed_measurement(20.)
+    self._reset_pinion_measurement(0.)
+    max_rt_msgs = int(self.LKA_FREQUENCY * common.RT_INTERVAL / 1e6 * 1.2 + 1)  # 1.2x buffer
+
+    # commands blasted without the clock advancing stop being accepted
+    for i in range(max_rt_msgs * 2):
+      with self.subTest(i=i):
+        self.assertEqual(i <= max_rt_msgs, self._tx(self._lka_angle_msg(2, 0., increment_timer=False)))
+
+    # one microsecond under the interval is still the same window
+    self.safety.set_timer(common.RT_INTERVAL - 1)
+    for _ in range(5):
+      self.assertFalse(self._tx(self._lka_angle_msg(2, 0., increment_timer=False)))
+
+    # crossing the interval resets the window on the next command
+    self.safety.set_timer(common.RT_INTERVAL)
+    self.assertFalse(self._tx(self._lka_angle_msg(2, 0., increment_timer=False)))
+    for _ in range(5):
+      self.assertTrue(self._tx(self._lka_angle_msg(2, 0., increment_timer=False)))
 
   def test_measured_angle_sample_is_required(self):
     # Regression test for the trap: if the pinion angle sample were never updated by the
@@ -773,8 +821,11 @@ class TestFordTransitLkaSafety(TestFordSafetyBase):
   def test_rx_hook_pinion_has_no_counter(self):
     # This PSCM does not transmit StePinAn_No_Cs or StePinAn_No_Cnt: both are a constant
     # zero across 856k captured frames, and the DBC says the checksum is "not transmitted
-    # on gas variants". Checking either would invalidate the message after
-    # MAX_WRONG_COUNTERS frames and permanently disable controls on the van.
+    # on gas variants". Checking the counter would invalidate the message after
+    # MAX_WRONG_COUNTERS frames and permanently disable controls on the van, which is why
+    # .ignore_counter is set. The accompanying .ignore_checksum is inert rather than
+    # load-bearing: neither ford_get_checksum nor ford_compute_checksum has a 0x07E case,
+    # so both return 0 for this message and the comparison would pass either way.
     self.safety.set_controls_allowed(True)
     for _ in range(4 * common.MAX_WRONG_COUNTERS):
       assert self._rx(self._pinion_angle_msg(0.))

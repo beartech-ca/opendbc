@@ -156,7 +156,7 @@ static void ford_rx_hook(const CANPacket_t *msg) {
     if ((msg->addr == FORD_SteeringPinion_Data) && ford_lka_steer) {
       // Signal: StePinComp_An_Est : 22|15@0+ (0.1,-1600) degrees
       // 15 bits, 0.1 deg/bit, -1600 deg offset -> tenths of a degree, matching
-      // FORD_LKA_STEERING_LIMITS.angle_deg_to_can
+      // FORD_LKA_DEG_TO_CAN in ford_tx_hook
       const int pinion_angle = (((msg->data[2] & 0x7FU) << 8) | msg->data[3]) - 16000U;
       update_sample(&angle_meas, pinion_angle);
     }
@@ -261,9 +261,10 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
       // what steer_angle_cmd_checks_vm's per-frame jerk term assumes. It is a RELATIVE
       // correction carrying the whole remaining error, handed to the PSCM, which applies it
       // over its own internal ramp. Rate-limiting the request would measure intent rather
-      // than motion, so this platform gets its own check with exactly two bounds: the
-      // magnitude of the relative request, and the ISO lateral acceleration of the absolute
-      // target it reconstructs to. There is deliberately no rate-of-change bound.
+      // than motion, so this platform gets its own check, without the per-frame jerk term:
+      // the magnitude of the relative request, the ISO lateral acceleration of the absolute
+      // target it reconstructs to, and the real-time cap on how many commands may be sent
+      // per interval. There is deliberately no per-frame rate-of-change bound.
       const AngleSteeringParams FORD_LKA_STEERING_PARAMS = {
         .slip_factor = -0.0004472752575630534f,  // calc_slip_factor(VM) for FORD_TRANSIT_MK5
         .steer_ratio = 20.9,
@@ -278,6 +279,12 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
       // Same value steer_angle_cmd_checks_vm uses: highway curves are rolled in the
       // direction of the turn, so the ISO limit gets a superelevation tolerance
       const float FORD_LKA_MAX_LATERAL_ACCEL = ISO_LATERAL_ACCEL + (EARTH_G * AVERAGE_ROAD_ROLL);  // ~3.6 m/s^2
+      // rt_angle_rate_limit_check reads only .frequency, and touches no limiter state
+      // other than rt_angle_msgs/ts_angle_check_last, so it does not reintroduce the
+      // desired_angle_last coupling the per-frame jerk term had.
+      const AngleSteeringLimits FORD_LKA_RT_LIMITS = {
+        .frequency = 33U,  // Lane_Assist_Data1 is sent at 33Hz
+      };
 
       // Only the four intervention requests actuate steering: 1/6 increasing left/right,
       // 2/4 standard left/right. 0 is idle and 3/5 suppress LKA, neither of which steers,
@@ -322,6 +329,13 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
         const int max_angle_can = (int)((max_angle * FORD_LKA_DEG_TO_CAN) + 1.0f);
 
         violation |= safety_max_limit_check(desired_angle, max_angle_can, -max_angle_can);
+
+        // *** angle real time rate limit check ***
+        // The two bounds above constrain each frame in isolation. The argument that the
+        // PSCM's own ramp bounds wheel motion was measured against a 33Hz command stream,
+        // so a fault emitting 0x3CA far faster would hand the PSCM many times the
+        // correction per unit time with every individual frame still inside both.
+        violation |= rt_angle_rate_limit_check(FORD_LKA_RT_LIMITS);
       }
 
       // No steering request allowed when lateral control is not allowed
@@ -428,7 +442,10 @@ static safety_config ford_init(uint16_t param) {
     // steering command is measured from. StePinAn_No_Cs and StePinAn_No_Cnt are not checked
     // because this PSCM does not transmit them: both are a constant zero across 856k frames
     // of Transit MK5 capture, matching the DBC's "Signal not transmitted on gas variants".
-    // Enforcing either would invalidate every frame and permanently disable controls.
+    // Enforcing the counter would invalidate every frame and permanently disable controls.
+    // .ignore_checksum is inert rather than load-bearing: neither ford_get_checksum nor
+    // ford_compute_checksum has a case for this message, so both return 0 and the
+    // comparison would pass whether or not it is ignored. It is set for intent.
     {.msg = {{FORD_SteeringPinion_Data, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},
   };
 
