@@ -155,7 +155,8 @@ class CarController(CarControllerBase):
     self.transit_lka = None
     if CP.flags & FordFlags.LKA_STEER:
       # the three A/B switches ride in spare CarParams.flags bits; see ford/values.py
-      self.transit_lka = TransitLkaState(*unpack_transit_lka_flags(CP.flags))
+      # the fourth setting (availability gate) is CarState's, not the controller's
+      self.transit_lka = TransitLkaState(*unpack_transit_lka_flags(CP.flags)[:3])
       self.desired_angle_last = 0.0
       self.lka_active_last = False
 

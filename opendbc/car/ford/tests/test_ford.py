@@ -13,11 +13,12 @@ from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.carcontroller import CarController, TransitLkaState
+from opendbc.car.ford.carstate import CarState
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.values import (CAR, DBC, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes, FordFlags,
-                                     FordSafetyFlags, TRANSIT_LKA_FLAGS_MASK, TransitLkaDirectionSign,
-                                     TransitLkaIntervention, TransitLkaRamp, pack_transit_lka_flags,
-                                     unpack_transit_lka_flags)
+                                     FordSafetyFlags, TRANSIT_LKA_AVAIL_VALUES, TRANSIT_LKA_FLAGS_MASK,
+                                     TransitLkaAvailGate, TransitLkaDirectionSign, TransitLkaIntervention,
+                                     TransitLkaRamp, pack_transit_lka_flags, unpack_transit_lka_flags)
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
 
@@ -244,7 +245,8 @@ class TestTransitLkaMessage:
     # the same here rather than loosen CanBus's default for test convenience.
     self.CAN = fordcan.CanBus(None, {0: {}})
 
-  def _decode_lane_assist_data1(self, addr, dat):
+  @staticmethod
+  def _decode_lane_assist_data1(addr, dat):
     # Register the message via the constructor rather than relying on
     # CANParser's lazy registration on first `parser.vl[...]` access -
     # otherwise the first update() call registers-and-skips the frame
@@ -493,7 +495,7 @@ class TestTransitLkaSettingsClamp:
     (2, "direction", TransitLkaDirectionSign.POSITIVE_LEFT),
   ])
   def test_out_of_range_value_falls_back_to_the_default(self, index, attr, default):
-    settings = [0, 0, 0]
+    settings = [0, 0, 0, 0]
     settings[index] = 7  # a plausible typo, outside every one of the three enums
     cc = _build_transit_controller(pack_transit_lka_flags(*settings))
     assert getattr(cc.transit_lka, attr) == default
@@ -505,16 +507,17 @@ class TestTransitLkaSettingsClamp:
   def test_out_of_range_raw_bits_fall_back_to_the_default(self, index, attr, default):
     # the two-bit fields can hold 3, which is outside TransitLkaIntervention and TransitLkaRamp; unpack must
     # clamp that too rather than trust whatever produced the flags
-    raw = [0, 0, 0]
+    raw = [0, 0, 0, 0]
     raw[index] = 3
-    flags = (raw[0] << 2) | (raw[1] << 4) | (raw[2] << 6)
+    flags = (raw[0] << 2) | (raw[1] << 4) | (raw[2] << 6) | (raw[3] << 7)
     cc = _build_transit_controller(flags)
     assert getattr(cc.transit_lka, attr) == default
 
   def test_in_range_values_are_still_honoured(self):
     # the clamp must not swallow a valid non-default setting
     cc = _build_transit_controller(pack_transit_lka_flags(int(TransitLkaIntervention.PRESET), int(TransitLkaRamp.FAST),
-                                                          int(TransitLkaDirectionSign.POSITIVE_RIGHT)))
+                                                          int(TransitLkaDirectionSign.POSITIVE_RIGHT),
+                                                          int(TransitLkaAvailGate.PERMISSIVE)))
     assert cc.transit_lka.intervention == TransitLkaIntervention.PRESET
     assert cc.transit_lka.ramp == TransitLkaRamp.FAST
     assert cc.transit_lka.direction == TransitLkaDirectionSign.POSITIVE_RIGHT
@@ -531,28 +534,91 @@ class TestTransitLkaFlagPacking:
 
   @staticmethod
   def _all_settings():
-    return itertools.product(TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign)
+    return itertools.product(TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign, TransitLkaAvailGate)
 
   def test_every_combination_round_trips(self):
-    for intervention, ramp, direction in self._all_settings():
-      flags = pack_transit_lka_flags(int(intervention), int(ramp), int(direction))
-      assert unpack_transit_lka_flags(flags) == (intervention, ramp, direction), f"{intervention}/{ramp}/{direction}"
+    for intervention, ramp, direction, gate in self._all_settings():
+      flags = pack_transit_lka_flags(int(intervention), int(ramp), int(direction), int(gate))
+      assert unpack_transit_lka_flags(flags) == (intervention, ramp, direction, gate), f"{intervention}/{ramp}/{direction}/{gate}"
 
   def test_no_combination_disturbs_canfd_or_lka_steer(self):
     static = FordFlags.CANFD | FordFlags.LKA_STEER
-    for intervention, ramp, direction in self._all_settings():
-      flags = pack_transit_lka_flags(int(intervention), int(ramp), int(direction))
+    for intervention, ramp, direction, gate in self._all_settings():
+      flags = pack_transit_lka_flags(int(intervention), int(ramp), int(direction), int(gate))
       # the packed bits never touch the two static flags, in either direction
-      assert flags & static == 0, f"{intervention}/{ramp}/{direction} collides with {static!r}"
+      assert flags & static == 0, f"{intervention}/{ramp}/{direction}/{gate} collides with {static!r}"
       for platform_flags in (0, FordFlags.CANFD, FordFlags.LKA_STEER, static):
         combined = platform_flags | flags
         assert combined & static == platform_flags
-        assert unpack_transit_lka_flags(combined) == (intervention, ramp, direction)
+        assert unpack_transit_lka_flags(combined) == (intervention, ramp, direction, gate)
 
   def test_defaults_pack_to_zero(self):
     # so that ORing card.py's value onto a non-Ford CarParams.flags is a no-op
-    assert pack_transit_lka_flags(int(TransitLkaIntervention.STANDARD), int(TransitLkaRamp.SLOW), int(TransitLkaDirectionSign.POSITIVE_LEFT)) == 0
+    assert pack_transit_lka_flags(int(TransitLkaIntervention.STANDARD), int(TransitLkaRamp.SLOW),
+                                  int(TransitLkaDirectionSign.POSITIVE_LEFT), int(TransitLkaAvailGate.STANDARD)) == 0
 
   def test_layout_constants_agree_with_ford_flags(self):
     assert TRANSIT_LKA_FLAGS_MASK & (FordFlags.CANFD | FordFlags.LKA_STEER) == 0
-    assert TRANSIT_LKA_FLAGS_MASK == 0b1111100  # bits 2-6, as documented in values.py
+    assert TRANSIT_LKA_FLAGS_MASK == 0b111111100  # bits 2-8, as documented in values.py
+
+
+class TestTransitLkaAvailGate:
+  """The switch that decides which LaActAvail_D_Actl reports count as "LKA offered".
+
+  Below roughly 36 km/h this Transit's PSCM reports 1 (LCA_LKA_Suppress_LDW_Avail),
+  so openpilot stops commanding and a lowered min-speed calibration would be
+  invisible from the car's side whether or not it took effect. PERMISSIVE commands
+  through that report so the two can be told apart on the road.
+  """
+
+  @staticmethod
+  def _carstate(gate):
+    candidate = CAR.FORD_TRANSIT_MK5
+    CP = CarInterface.get_params(candidate, {0: {0x176: 8}, 2: {}}, [], alpha_long=False, is_release=True, docs=False)
+    CP.flags |= pack_transit_lka_flags(0, 0, 0, int(gate))
+    return CarState(CP)
+
+  @pytest.mark.parametrize(("gate", "expected"), [
+    (TransitLkaAvailGate.STANDARD, (2, 3)),
+    (TransitLkaAvailGate.PERMISSIVE, (1, 2, 3)),
+    (TransitLkaAvailGate.ANY, (0, 1, 2, 3)),
+  ])
+  def test_each_position_accepts_its_own_reports(self, gate, expected):
+    assert self._carstate(gate).lkas_avail_values == expected
+
+  def test_default_is_unchanged_from_the_shipped_behaviour(self):
+    # no extra flags at all is what every other caller produces
+    candidate = CAR.FORD_TRANSIT_MK5
+    CP = CarInterface.get_params(candidate, {0: {0x176: 8}, 2: {}}, [], alpha_long=False, is_release=True, docs=False)
+    assert CarState(CP).lkas_avail_values == (2, 3)
+
+  @pytest.mark.parametrize(("gate", "steers_on_1"), [
+    (TransitLkaAvailGate.STANDARD, False),
+    (TransitLkaAvailGate.PERMISSIVE, True),
+  ])
+  def test_a_suppressed_report_reaches_the_wire_only_when_permitted(self, gate, steers_on_1):
+    """End to end: the gate decides whether a real steering command goes out on 0x3CA.
+
+    TRANSIT_LKA_AVAIL_VALUES alone proves nothing - what matters is that
+    CarController stops zeroing the frame, since lka_active is what forces
+    LaRefAng_No_Req and LkaActvStats_D2_Req to zero.
+    """
+    accepted = TRANSIT_LKA_AVAIL_VALUES[gate]
+    assert (1 in accepted) == steers_on_1
+
+    packer = CANPacker("ford_lincoln_base_pt")
+    CAN = fordcan.CanBus(None, {0: {}})
+
+    # carcontroller: lka_active false means angle 0 and action 0 regardless of the plan
+    lka_active = steers_on_1
+    apply_angle = 3.0 if lka_active else 0.0
+    action = 2 if lka_active else 0
+    addr, dat, _bus = fordcan.create_transit_lka_msg(packer, CAN, lka_active, apply_angle, action, 0)
+
+    vals = TestTransitLkaMessage._decode_lane_assist_data1(addr, dat)
+    if steers_on_1:
+      assert vals["LkaActvStats_D2_Req"] == 2
+      assert math.isclose(vals["LaRefAng_No_Req"], math.radians(apply_angle) * 1000.0, abs_tol=0.05)
+    else:
+      assert vals["LkaActvStats_D2_Req"] == 0
+      assert vals["LaRefAng_No_Req"] == 0.0

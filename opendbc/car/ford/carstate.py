@@ -2,7 +2,7 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.ford.fordcan import CanBus
-from opendbc.car.ford.values import DBC, CarControllerParams, FordFlags
+from opendbc.car.ford.values import CarControllerParams, DBC, FordFlags, TRANSIT_LKA_AVAIL_VALUES, unpack_transit_lka_flags
 from opendbc.car.interfaces import CarStateBase
 
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -20,6 +20,8 @@ class CarState(CarStateBase):
     self.distance_button = 0
     self.lc_button = 0
     self.lkas_available = False
+    # Which LaActAvail_D_Actl values count as "LKA offered"; switchable, see values.py
+    self.lkas_avail_values = TRANSIT_LKA_AVAIL_VALUES[unpack_transit_lka_flags(CP.flags)[3]]
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -59,8 +61,10 @@ class CarState(CarStateBase):
 
     # LaActAvail_D_Actl: 3 "LKA_LCA_LDW_Avail", 2 "LCA_LKA_Avail_LDW_Suppress",
     # 1 "LCA_LKA_Suppress_LDW_Avail", 0 "LCA_LKA_LDW_Suppress". LKA is offered
-    # in both 3 and 2 - 2 only suppresses the LDW warning.
-    self.lkas_available = cp.vl["Lane_Assist_Data3_FD1"]["LaActAvail_D_Actl"] in (2, 3)
+    # in both 3 and 2 - 2 only suppresses the LDW warning. The accepted set is
+    # switchable (TransitLkaAvailGate) so the 1 report, which this Transit's PSCM
+    # sends below roughly 36 km/h, can be commanded through as an experiment.
+    self.lkas_available = cp.vl["Lane_Assist_Data3_FD1"]["LaActAvail_D_Actl"] in self.lkas_avail_values
 
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False

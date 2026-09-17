@@ -67,9 +67,10 @@ class FordFlags(IntFlag):
 #   bits 2-3  Transit LKA intervention   (TransitLkaIntervention,   0-2)
 #   bits 4-5  Transit LKA ramp           (TransitLkaRamp,           0-2)
 #   bit    6  Transit LKA direction sign (TransitLkaDirectionSign,  0-1)
-#   bits 7-31 free
+#   bits 7-8  Transit LKA availability gate (TransitLkaAvailGate,   0-2)
+#   bits 9-31 free
 #
-# Any new FordFlags member must take a free bit from 7 upwards, never one of bits 2-6;
+# Any new FordFlags member must take a free bit from 9 upwards, never one of bits 2-8;
 # test_ford.TestTransitLkaFlagPacking guards that.
 TRANSIT_LKA_INTERVENTION_SHIFT = 2
 TRANSIT_LKA_INTERVENTION_MASK = 0b11 << TRANSIT_LKA_INTERVENTION_SHIFT      # 0x0C
@@ -77,7 +78,10 @@ TRANSIT_LKA_RAMP_SHIFT = 4
 TRANSIT_LKA_RAMP_MASK = 0b11 << TRANSIT_LKA_RAMP_SHIFT                      # 0x30
 TRANSIT_LKA_DIRECTION_SIGN_SHIFT = 6
 TRANSIT_LKA_DIRECTION_SIGN_MASK = 0b1 << TRANSIT_LKA_DIRECTION_SIGN_SHIFT   # 0x40
-TRANSIT_LKA_FLAGS_MASK = TRANSIT_LKA_INTERVENTION_MASK | TRANSIT_LKA_RAMP_MASK | TRANSIT_LKA_DIRECTION_SIGN_MASK
+TRANSIT_LKA_AVAIL_GATE_SHIFT = 7
+TRANSIT_LKA_AVAIL_GATE_MASK = 0b11 << TRANSIT_LKA_AVAIL_GATE_SHIFT          # 0x180
+TRANSIT_LKA_FLAGS_MASK = (TRANSIT_LKA_INTERVENTION_MASK | TRANSIT_LKA_RAMP_MASK |
+                          TRANSIT_LKA_DIRECTION_SIGN_MASK | TRANSIT_LKA_AVAIL_GATE_MASK)
 
 
 # All three switches are independent so each can be A/B tested on its own. The preset
@@ -100,6 +104,31 @@ class TransitLkaDirectionSign(IntEnum):
   POSITIVE_RIGHT = 1
 
 
+class TransitLkaAvailGate(IntEnum):
+  """Which LaActAvail_D_Actl values count as "the PSCM is offering LKA".
+
+  STANDARD is what the signal's own VAL table says: 3 offers everything, 2 offers LKA
+  and only suppresses the LDW warning. Below roughly 36 km/h this Transit's PSCM
+  reports 1 instead, and openpilot stops commanding - which is also why a lowered
+  min-speed calibration would be invisible from the car's side even if it took effect.
+  PERMISSIVE commands through that report to find out whether the PSCM actually steers;
+  ANY additionally commands through 0, where the PSCM says every lateral feature is
+  suppressed. Neither changes what the safety layer accepts - the angle, rate and
+  lateral-acceleration checks in safety/modes/ford.h are unaffected.
+  """
+  STANDARD = 0
+  PERMISSIVE = 1
+  ANY = 2
+
+
+# LaActAvail_D_Actl values each gate position treats as "LKA offered".
+TRANSIT_LKA_AVAIL_VALUES: dict[int, tuple[int, ...]] = {
+  TransitLkaAvailGate.STANDARD: (2, 3),
+  TransitLkaAvailGate.PERMISSIVE: (1, 2, 3),
+  TransitLkaAvailGate.ANY: (0, 1, 2, 3),
+}
+
+
 def _coerce_transit_lka_setting(enum_cls: type[IntEnum], value: int) -> IntEnum:
   """Coerce a Params-sourced switch to its enum, falling back to the default.
 
@@ -119,7 +148,7 @@ def _coerce_transit_lka_setting(enum_cls: type[IntEnum], value: int) -> IntEnum:
     return default
 
 
-def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int) -> int:
+def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int, avail_gate: int = 0) -> int:
   """Pack the three switches into their CarParams.flags bits (layout above).
 
   Clamping happens here as well as on unpack because direction sign only owns one bit:
@@ -129,19 +158,22 @@ def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int) ->
   """
   return ((int(_coerce_transit_lka_setting(TransitLkaIntervention, intervention)) << TRANSIT_LKA_INTERVENTION_SHIFT) |
           (int(_coerce_transit_lka_setting(TransitLkaRamp, ramp)) << TRANSIT_LKA_RAMP_SHIFT) |
-          (int(_coerce_transit_lka_setting(TransitLkaDirectionSign, direction_sign)) << TRANSIT_LKA_DIRECTION_SIGN_SHIFT))
+          (int(_coerce_transit_lka_setting(TransitLkaDirectionSign, direction_sign)) << TRANSIT_LKA_DIRECTION_SIGN_SHIFT) |
+          (int(_coerce_transit_lka_setting(TransitLkaAvailGate, avail_gate)) << TRANSIT_LKA_AVAIL_GATE_SHIFT))
 
 
-def unpack_transit_lka_flags(flags: int) -> tuple[TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign]:
+def unpack_transit_lka_flags(flags: int) -> tuple[TransitLkaIntervention, TransitLkaRamp,
+                                                  TransitLkaDirectionSign, TransitLkaAvailGate]:
   """Unpack the three switches from CarParams.flags (layout above).
 
-  The two-bit fields can still hold 3, which is outside TransitLkaIntervention and
-  TransitLkaRamp, so the clamp runs here too rather than trusting whatever produced
-  the flags.
+  The two-bit fields can still hold 3, which is outside TransitLkaIntervention,
+  TransitLkaRamp and TransitLkaAvailGate, so the clamp runs here too rather than
+  trusting whatever produced the flags.
   """
   return (_coerce_transit_lka_setting(TransitLkaIntervention, (flags & TRANSIT_LKA_INTERVENTION_MASK) >> TRANSIT_LKA_INTERVENTION_SHIFT),
           _coerce_transit_lka_setting(TransitLkaRamp, (flags & TRANSIT_LKA_RAMP_MASK) >> TRANSIT_LKA_RAMP_SHIFT),
-          _coerce_transit_lka_setting(TransitLkaDirectionSign, (flags & TRANSIT_LKA_DIRECTION_SIGN_MASK) >> TRANSIT_LKA_DIRECTION_SIGN_SHIFT))
+          _coerce_transit_lka_setting(TransitLkaDirectionSign, (flags & TRANSIT_LKA_DIRECTION_SIGN_MASK) >> TRANSIT_LKA_DIRECTION_SIGN_SHIFT),
+          _coerce_transit_lka_setting(TransitLkaAvailGate, (flags & TRANSIT_LKA_AVAIL_GATE_MASK) >> TRANSIT_LKA_AVAIL_GATE_SHIFT))
 
 
 class RADAR:
