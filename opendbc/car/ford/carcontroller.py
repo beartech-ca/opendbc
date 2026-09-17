@@ -4,7 +4,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.transit_lka import TransitLkaState, Intervention, Ramp, DirectionSign, coerce_setting
+from opendbc.car.ford.transit_lka import TransitLkaState, unpack_flags
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -78,9 +78,8 @@ class CarController(CarControllerBase):
 
     self.transit_lka = None
     if CP.flags & FordFlags.LKA_STEER:
-      self.transit_lka = TransitLkaState(coerce_setting(Intervention, CP.transitLka.intervention),
-                                         coerce_setting(Ramp, CP.transitLka.ramp),
-                                         coerce_setting(DirectionSign, CP.transitLka.directionSign))
+      # the three A/B switches ride in spare CarParams.flags bits; see ford/values.py
+      self.transit_lka = TransitLkaState(*unpack_flags(CP.flags))
       self.desired_angle_last = 0.0
       self.lka_active_last = False
 

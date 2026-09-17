@@ -527,14 +527,6 @@ struct CarParams {
   secOcRequired @75 :Bool;  # Car requires SecOC message authentication to operate
   secOcKeyAvailable @76 :Bool;  # Stored SecOC key loaded from params
 
-  transitLka @78 :TransitLkaSettings;
-
-  struct TransitLkaSettings {
-    intervention @0 :UInt8;   # 0 standard, 1 increasing, 2 preset
-    ramp @1 :UInt8;           # 0 slow, 1 fast, 2 preset
-    directionSign @2 :UInt8;  # 0 positive-is-left, 1 positive-is-right
-  }
-
   struct SafetyConfig {
     safetyModel @0 :SafetyModel;
     safetyParam @3 :UInt16;

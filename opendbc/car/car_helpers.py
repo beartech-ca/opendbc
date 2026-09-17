@@ -6,7 +6,6 @@ from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
 from opendbc.car.carlog import carlog
 from opendbc.car.structs import CarParams, CarParamsT
 from opendbc.car.fingerprints import eliminate_incompatible_cars, all_legacy_fingerprint_cars
-from opendbc.car.ford.values import FordFlags
 from opendbc.car.fw_versions import ObdCallback, get_fw_versions_ordered, get_present_ecus, match_fw_to_car
 from opendbc.car.mock.values import CAR as MOCK
 from opendbc.car.values import BRANDS
@@ -149,17 +148,8 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
   return car_fingerprint, finger, vin, car_fw, source, exact_match
 
 
-def _apply_transit_lka(CP: CarParams, transit_lka: 'CarParams.TransitLkaSettings | None') -> None:
-  # Transit LKA A/B test switches (card.py's TransitLka* Params) only mean anything on
-  # Ford's LKA_STEER platforms; every other brand/platform ignores transit_lka entirely.
-  # CarParams is a mutable capnp builder here, so this lands before the CarController
-  # (constructed by get_car's caller below) reads CP.transitLka.
-  if transit_lka is not None and CP.flags & FordFlags.LKA_STEER:
-    CP.transitLka = transit_lka
-
-
 def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multiplexing: ObdCallback, alpha_long_allowed: bool,
-            is_release: bool, cached_params: CarParamsT | None = None, transit_lka: 'CarParams.TransitLkaSettings | None' = None):
+            is_release: bool, cached_params: CarParamsT | None = None, extra_flags: int = 0):
   candidate, fingerprints, vin, car_fw, source, exact_match = fingerprint(can_recv, can_send, set_obd_multiplexing, cached_params)
 
   if candidate is None:
@@ -172,7 +162,10 @@ def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multip
   CP.carFw = car_fw
   CP.fingerprintSource = source
   CP.fuzzyFingerprint = not exact_match
-  _apply_transit_lka(CP, transit_lka)
+  # brand-specific quirk bits chosen by the caller from openpilot Params; 0 for every
+  # caller that has none. CarParams is a mutable capnp builder here, so this lands
+  # before the CarInterface/CarController constructed below reads CP.flags.
+  CP.flags |= extra_flags
 
   return interfaces[CP.carFingerprint](CP)
 

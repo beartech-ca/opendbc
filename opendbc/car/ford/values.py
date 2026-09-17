@@ -56,6 +56,29 @@ class FordFlags(IntFlag):
   LKA_STEER = 2
 
 
+# CarParams.flags bit layout for Ford. flags is upstream's UInt32 "flags for car specific
+# quirks"; the three Transit LKA switches live in spare bits of it rather than in a new
+# car.capnp field, so this fork claims no schema ordinal and cannot diverge from upstream's
+# wire format. Bit packing costs readability, so the whole layout is spelled out here:
+#
+#   bit    0  FordFlags.CANFD
+#   bit    1  FordFlags.LKA_STEER
+#   bits 2-3  Transit LKA intervention   (transit_lka.Intervention,   0-2)
+#   bits 4-5  Transit LKA ramp           (transit_lka.Ramp,           0-2)
+#   bit    6  Transit LKA direction sign (transit_lka.DirectionSign,  0-1)
+#   bits 7-31 free
+#
+# Pack and unpack live in transit_lka.py. Any new FordFlags member must take a free bit
+# from 7 upwards, never one of bits 2-6; test_transit_lka.TestFlagPacking guards that.
+TRANSIT_LKA_INTERVENTION_SHIFT = 2
+TRANSIT_LKA_INTERVENTION_MASK = 0b11 << TRANSIT_LKA_INTERVENTION_SHIFT      # 0x0C
+TRANSIT_LKA_RAMP_SHIFT = 4
+TRANSIT_LKA_RAMP_MASK = 0b11 << TRANSIT_LKA_RAMP_SHIFT                      # 0x30
+TRANSIT_LKA_DIRECTION_SIGN_SHIFT = 6
+TRANSIT_LKA_DIRECTION_SIGN_MASK = 0b1 << TRANSIT_LKA_DIRECTION_SIGN_SHIFT   # 0x40
+TRANSIT_LKA_FLAGS_MASK = TRANSIT_LKA_INTERVENTION_MASK | TRANSIT_LKA_RAMP_MASK | TRANSIT_LKA_DIRECTION_SIGN_MASK
+
+
 class RADAR:
   DELPHI_ESR = 'ford_fusion_2018_adas'
   DELPHI_MRR = 'FORD_CADS'
