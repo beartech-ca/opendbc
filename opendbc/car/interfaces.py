@@ -128,7 +128,7 @@ class CarInterfaceBase(ABC):
 
   @classmethod
   def get_params(cls, candidate: str, fingerprint: dict[int, dict[int, int]], car_fw: list[structs.CarParams.CarFw],
-                 alpha_long: bool, is_release: bool, docs: bool) -> structs.CarParams:
+                 alpha_long: bool, is_release: bool, docs: bool, extra_flags: int = 0) -> structs.CarParams:
     ret = CarInterfaceBase.get_std_params(candidate)
 
     platform = PLATFORMS[candidate]
@@ -140,6 +140,10 @@ class CarInterfaceBase(ABC):
     ret.minSteerSpeed = platform.config.specs.minSteerSpeed
     ret.tireStiffnessFactor = platform.config.specs.tireStiffnessFactor
     ret.flags |= int(platform.config.flags)
+    # Caller-chosen quirk bits (openpilot Params -> car_helpers.get_car). They land before
+    # _get_params so a brand can derive safetyConfigs from them; CarParams is read-only by
+    # the time controlsd constructs a CarInterface, so nothing may be set from __init__.
+    ret.flags |= extra_flags
 
     ret = cls._get_params(ret, candidate, fingerprint, car_fw, alpha_long, is_release, docs)
 

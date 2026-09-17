@@ -20,17 +20,6 @@ class CarInterface(CarInterfaceBase):
 
   DRIVABLE_GEARS = (structs.CarState.GearShifter.low, structs.CarState.GearShifter.manumatic)
 
-  def __init__(self, CP):
-    # The A/B switches live in spare CarParams.flags bits, and car_helpers.get_car ORs
-    # them on *after* get_params has already built safetyConfigs, so get_params cannot
-    # see them. This is the first point holding both the switch and a still-mutable
-    # CarParams, and CP here is the same builder card.py later hands to pandad.
-    # Only continuation has to reach the safety layer; the other four switches are read
-    # straight from CP.flags by CarController and CarState.
-    if unpack_transit_lka_flags(CP.flags)[4] == TransitLkaContinuation.ON:
-      CP.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LKA_CONTINUATION.value
-    super().__init__(CP)
-
   @staticmethod
   def get_pid_accel_limits(CP, current_speed, cruise_speed):
     # PCM doesn't allow acceleration near cruise_speed,
@@ -70,6 +59,10 @@ class CarInterface(CarInterfaceBase):
 
     if ret.flags & FordFlags.LKA_STEER:
       ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LKA_STEER.value
+      # Mirrors panda's own gate: ford_lka_continuation_enabled is ford_lka_steer AND the
+      # flag (safety/modes/ford.h). The switch reaches here through get_params' extra_flags.
+      if unpack_transit_lka_flags(ret.flags)[4] == TransitLkaContinuation.ON:
+        ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LKA_CONTINUATION.value
 
     if ret.flags & FordFlags.CANFD:
       ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.CANFD.value

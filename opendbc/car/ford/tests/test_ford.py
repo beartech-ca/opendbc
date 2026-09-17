@@ -1,3 +1,4 @@
+import copy
 import itertools
 import math
 import random
@@ -396,10 +397,11 @@ class TestTransitLkaDirectionSign:
 
 def _build_transit_controller(extra_flags: int = 0):
   candidate = CAR.FORD_TRANSIT_MK5
-  CP = CarInterface.get_params(candidate, {0: {}, 2: {}}, [], alpha_long=False, is_release=True, docs=False)
-  # Mirrors what get_car does: OR the caller's packed quirk bits onto the CarParams capnp
-  # builder before the CarController (which unpacks them out of CP.flags) is constructed.
-  CP.flags |= extra_flags
+  # Exactly how car_helpers.get_car builds it: the packed quirk bits go in through
+  # get_params, so everything derived from them - safetyConfigs included - is computed
+  # there while CarParams is still mutable.
+  CP = CarInterface.get_params(candidate, {0: {}, 2: {}}, [], alpha_long=False, is_release=True,
+                               docs=False, extra_flags=extra_flags)
   dbc_names = {Bus.pt: DBC[candidate][Bus.pt]}
   return CarController(dbc_names, CP)
 
@@ -578,8 +580,8 @@ class TestTransitLkaAvailGate:
   @staticmethod
   def _carstate(gate):
     candidate = CAR.FORD_TRANSIT_MK5
-    CP = CarInterface.get_params(candidate, {0: {0x176: 8}, 2: {}}, [], alpha_long=False, is_release=True, docs=False)
-    CP.flags |= pack_transit_lka_flags(0, 0, 0, int(gate))
+    CP = CarInterface.get_params(candidate, {0: {0x176: 8}, 2: {}}, [], alpha_long=False, is_release=True,
+                                 docs=False, extra_flags=pack_transit_lka_flags(0, 0, 0, int(gate)))
     return CarState(CP)
 
   @pytest.mark.parametrize(("gate", "expected"), [
@@ -641,8 +643,9 @@ class TestTransitLkaContinuation:
   @staticmethod
   def _carstate(on):
     CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
-                                 alpha_long=False, is_release=True, docs=False)
-    CP.flags |= pack_transit_lka_flags(0, 0, 0, 0, int(TransitLkaContinuation.ON if on else TransitLkaContinuation.OFF))
+                                 alpha_long=False, is_release=True, docs=False,
+                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 0,
+                                   int(TransitLkaContinuation.ON if on else TransitLkaContinuation.OFF)))
     return CarState(CP)
 
   @staticmethod
@@ -715,8 +718,8 @@ class TestTransitLkaContinuation:
   def _accdata_while(latched, accel=-2.0):
     """Run the real controller and return what ACCDATA (0x186) actually carried."""
     CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
-                                 alpha_long=False, is_release=True, docs=False)
-    CP.flags |= pack_transit_lka_flags(0, 0, 0, 0, int(TransitLkaContinuation.ON))
+                                 alpha_long=False, is_release=True, docs=False,
+                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 0, int(TransitLkaContinuation.ON)))
     assert CP.openpilotLongitudinalControl, "precondition: this platform runs openpilot long"
     car_interface = CarInterface(CP)
     car_interface.update([])
@@ -762,13 +765,25 @@ class TestTransitLkaContinuation:
 
   def test_the_switch_reaches_the_safety_layer(self):
     """Unlike the other four switches this one has to be in safetyParam, because panda
-    recomputes the latch itself. get_params cannot see it (car_helpers.get_car ORs the
-    flags on afterwards), so CarInterface.__init__ is what puts it there."""
+    recomputes the latch itself, so get_params has to see it."""
     for on, expected in ((False, False), (True, True)):
       CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
-                                   alpha_long=False, is_release=True, docs=False)
-      assert not (CP.safetyConfigs[-1].safetyParam & FordSafetyFlags.LKA_CONTINUATION), "get_params must not set it"
-      CP.flags |= pack_transit_lka_flags(0, 0, 0, 0, int(on))
-      CarInterface(CP)
+                                   alpha_long=False, is_release=True, docs=False,
+                                   extra_flags=pack_transit_lka_flags(0, 0, 0, 0, int(on)))
       got = bool(CP.safetyConfigs[-1].safetyParam & FordSafetyFlags.LKA_CONTINUATION)
       assert got is expected
+
+  def test_constructing_the_interface_leaves_carparams_alone(self):
+    """controlsd builds its CarInterface from the carParams *message*, which is a
+    read-only capnp reader. An earlier revision set this flag in CarInterface.__init__;
+    there it raised AttributeError, controlsd never came up, card sent no CAN, and with
+    panda already blocking the camera's ACCDATA the PCM faulted cruise about eleven
+    seconds into the drive (recorded routes 00000011 and 00000012). Nothing may be
+    written to CarParams outside get_params."""
+    CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
+                                 alpha_long=False, is_release=True, docs=False,
+                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 0, int(TransitLkaContinuation.ON)))
+    before = copy.deepcopy(CP)
+    CarInterface(CP)
+    assert CP.flags == before.flags
+    assert [c.safetyParam for c in CP.safetyConfigs] == [c.safetyParam for c in before.safetyConfigs]

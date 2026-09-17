@@ -157,15 +157,12 @@ def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multip
     candidate = "MOCK"
 
   CarInterface = interfaces[candidate]
-  CP: CarParams = CarInterface.get_params(candidate, fingerprints, car_fw, alpha_long_allowed, is_release, docs=False)
+  CP: CarParams = CarInterface.get_params(candidate, fingerprints, car_fw, alpha_long_allowed, is_release,
+                                          docs=False, extra_flags=extra_flags)
   CP.carVin = vin
   CP.carFw = car_fw
   CP.fingerprintSource = source
   CP.fuzzyFingerprint = not exact_match
-  # brand-specific quirk bits chosen by the caller from openpilot Params; 0 for every
-  # caller that has none. CarParams is a mutable capnp builder here, so this lands
-  # before the CarInterface/CarController constructed below reads CP.flags.
-  CP.flags |= extra_flags
 
   return interfaces[CP.carFingerprint](CP)
 
