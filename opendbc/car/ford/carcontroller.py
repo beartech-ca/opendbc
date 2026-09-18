@@ -4,8 +4,10 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.values import (CarControllerParams, FordFlags, CAR, TransitLkaDirectionSign,
-                                     TransitLkaIntervention, TransitLkaRamp, unpack_transit_lka_flags)
+from opendbc.car.ford.human_turn import HumanTurnDetector
+from opendbc.car.ford.values import (CarControllerParams, FordFlags, CAR, TransitHumanTurn,
+                                     TransitLkaDirectionSign, TransitLkaIntervention, TransitLkaRamp,
+                                     unpack_transit_lka_flags)
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -159,6 +161,11 @@ class CarController(CarControllerBase):
       self.transit_lka = TransitLkaState(*unpack_transit_lka_flags(CP.flags)[:3])
       self.desired_angle_last = 0.0
       self.lka_active_last = False
+      # Human-turn override (ported from BluePilot; see ford/human_turn.py). Constructed only
+      # when the switch is on, so with it off nothing about this path changes.
+      self.human_turn = (HumanTurnDetector()
+                         if unpack_transit_lka_flags(CP.flags)[6] == TransitHumanTurn.ON else None)
+      self.human_turn_active = False
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
@@ -222,7 +229,15 @@ class CarController(CarControllerBase):
     # send lka msg at 33Hz
     if self.CP.flags & FordFlags.LKA_STEER:
       if (self.frame % CarControllerParams.LKA_STEP) == 0:
-        lka_active = CC.latActive and CS.lkas_available
+        # Human-turn override: a sustained driver turn hands lateral back rather than leaving
+        # the command running against the wheel. Ticked here, at LKA_STEP, which is the rate
+        # human_turn.py's hold thresholds are scaled for.
+        self.human_turn_active = False
+        if self.human_turn is not None:
+          self.human_turn_active = self.human_turn.update(CC.latActive, CS.out.steeringPressed,
+                                                          CS.out.steeringAngleDeg)
+
+        lka_active = CC.latActive and CS.lkas_available and not self.human_turn_active
         apply_angle = 0.0
         action, ramp_type = 0, 0
         if lka_active:

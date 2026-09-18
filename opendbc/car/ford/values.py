@@ -70,9 +70,11 @@ class FordFlags(IntFlag):
 #   bit    6  Transit LKA direction sign (TransitLkaDirectionSign,  0-1)
 #   bits 7-8  Transit LKA availability gate (TransitLkaAvailGate,   0-2)
 #   bit    9  Transit LKA continuation      (TransitLkaContinuation, 0-1)
-#   bits 10-31 free
+#   bit   10  Transit lane centering        (TransitLaneCentering,   0-1)
+#   bit   11  Transit human-turn override   (TransitHumanTurn,       0-1)
+#   bits 12-31 free
 #
-# Any new FordFlags member must take a free bit from 10 upwards, never one of bits 2-9;
+# Any new FordFlags member must take a free bit from 12 upwards, never one of bits 2-11;
 # test_ford.TestTransitLkaFlagPacking guards that.
 TRANSIT_LKA_INTERVENTION_SHIFT = 2
 TRANSIT_LKA_INTERVENTION_MASK = 0b11 << TRANSIT_LKA_INTERVENTION_SHIFT      # 0x0C
@@ -84,9 +86,14 @@ TRANSIT_LKA_AVAIL_GATE_SHIFT = 7
 TRANSIT_LKA_AVAIL_GATE_MASK = 0b11 << TRANSIT_LKA_AVAIL_GATE_SHIFT          # 0x180
 TRANSIT_LKA_CONTINUATION_SHIFT = 9
 TRANSIT_LKA_CONTINUATION_MASK = 0b1 << TRANSIT_LKA_CONTINUATION_SHIFT       # 0x200
+TRANSIT_LANE_CENTERING_SHIFT = 10
+TRANSIT_LANE_CENTERING_MASK = 0b1 << TRANSIT_LANE_CENTERING_SHIFT           # 0x400
+TRANSIT_HUMAN_TURN_SHIFT = 11
+TRANSIT_HUMAN_TURN_MASK = 0b1 << TRANSIT_HUMAN_TURN_SHIFT                   # 0x800
 TRANSIT_LKA_FLAGS_MASK = (TRANSIT_LKA_INTERVENTION_MASK | TRANSIT_LKA_RAMP_MASK |
                           TRANSIT_LKA_DIRECTION_SIGN_MASK | TRANSIT_LKA_AVAIL_GATE_MASK |
-                          TRANSIT_LKA_CONTINUATION_MASK)
+                          TRANSIT_LKA_CONTINUATION_MASK |
+                          TRANSIT_LANE_CENTERING_MASK | TRANSIT_HUMAN_TURN_MASK)
 
 
 # All three switches are independent so each can be A/B tested on its own. The preset
@@ -124,6 +131,26 @@ class TransitLkaAvailGate(IntEnum):
   STANDARD = 0
   PERMISSIVE = 1
   ANY = 2
+
+
+class TransitLaneCentering(IntEnum):
+  """Nudge the planner's curvature toward true lane-line centre before it becomes an angle.
+
+  Ported from BluePilot; see ford/lane_center_trim.py. OFF reproduces today's behaviour
+  exactly - the trim is not constructed at all.
+  """
+  OFF = 0
+  ON = 1
+
+
+class TransitHumanTurn(IntEnum):
+  """Force lateral inactive while the driver holds a sustained turn.
+
+  Ported from BluePilot; see ford/human_turn.py. OFF reproduces today's behaviour, where
+  a sustained driver turn leaves the command running against the wheel.
+  """
+  OFF = 0
+  ON = 1
 
 
 class TransitLkaContinuation(IntEnum):
@@ -184,8 +211,8 @@ def _coerce_transit_lka_setting(enum_cls: type[IntEnum], value: int) -> IntEnum:
 
 
 def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int, avail_gate: int = 0,
-                           continuation: int = 0) -> int:
-  """Pack the three switches into their CarParams.flags bits (layout above).
+                           continuation: int = 0, lane_centering: int = 0, human_turn: int = 0) -> int:
+  """Pack the switches into their CarParams.flags bits (layout above).
 
   Clamping happens here as well as on unpack because direction sign only owns one bit:
   a typo'd param would otherwise survive the round trip as a valid-looking
@@ -196,12 +223,15 @@ def pack_transit_lka_flags(intervention: int, ramp: int, direction_sign: int, av
           (int(_coerce_transit_lka_setting(TransitLkaRamp, ramp)) << TRANSIT_LKA_RAMP_SHIFT) |
           (int(_coerce_transit_lka_setting(TransitLkaDirectionSign, direction_sign)) << TRANSIT_LKA_DIRECTION_SIGN_SHIFT) |
           (int(_coerce_transit_lka_setting(TransitLkaAvailGate, avail_gate)) << TRANSIT_LKA_AVAIL_GATE_SHIFT) |
-          (int(_coerce_transit_lka_setting(TransitLkaContinuation, continuation)) << TRANSIT_LKA_CONTINUATION_SHIFT))
+          (int(_coerce_transit_lka_setting(TransitLkaContinuation, continuation)) << TRANSIT_LKA_CONTINUATION_SHIFT) |
+          (int(_coerce_transit_lka_setting(TransitLaneCentering, lane_centering)) << TRANSIT_LANE_CENTERING_SHIFT) |
+          (int(_coerce_transit_lka_setting(TransitHumanTurn, human_turn)) << TRANSIT_HUMAN_TURN_SHIFT))
 
 
 def unpack_transit_lka_flags(flags: int) -> tuple[TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign,
-                                                  TransitLkaAvailGate, TransitLkaContinuation]:
-  """Unpack the three switches from CarParams.flags (layout above).
+                                                  TransitLkaAvailGate, TransitLkaContinuation,
+                                                  TransitLaneCentering, TransitHumanTurn]:
+  """Unpack the switches from CarParams.flags (layout above).
 
   The two-bit fields can still hold 3, which is outside TransitLkaIntervention,
   TransitLkaRamp and TransitLkaAvailGate, so the clamp runs here too rather than
@@ -211,7 +241,9 @@ def unpack_transit_lka_flags(flags: int) -> tuple[TransitLkaIntervention, Transi
           _coerce_transit_lka_setting(TransitLkaRamp, (flags & TRANSIT_LKA_RAMP_MASK) >> TRANSIT_LKA_RAMP_SHIFT),
           _coerce_transit_lka_setting(TransitLkaDirectionSign, (flags & TRANSIT_LKA_DIRECTION_SIGN_MASK) >> TRANSIT_LKA_DIRECTION_SIGN_SHIFT),
           _coerce_transit_lka_setting(TransitLkaAvailGate, (flags & TRANSIT_LKA_AVAIL_GATE_MASK) >> TRANSIT_LKA_AVAIL_GATE_SHIFT),
-          _coerce_transit_lka_setting(TransitLkaContinuation, (flags & TRANSIT_LKA_CONTINUATION_MASK) >> TRANSIT_LKA_CONTINUATION_SHIFT))
+          _coerce_transit_lka_setting(TransitLkaContinuation, (flags & TRANSIT_LKA_CONTINUATION_MASK) >> TRANSIT_LKA_CONTINUATION_SHIFT),
+          _coerce_transit_lka_setting(TransitLaneCentering, (flags & TRANSIT_LANE_CENTERING_MASK) >> TRANSIT_LANE_CENTERING_SHIFT),
+          _coerce_transit_lka_setting(TransitHumanTurn, (flags & TRANSIT_HUMAN_TURN_MASK) >> TRANSIT_HUMAN_TURN_SHIFT))
 
 
 class RADAR:

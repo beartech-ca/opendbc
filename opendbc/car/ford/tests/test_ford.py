@@ -8,7 +8,7 @@ import pytest
 from hypothesis import settings, given, strategies as st
 
 from opendbc.can import CANPacker, CANParser
-from opendbc.car import Bus, structs
+from opendbc.car import Bus, DT_CTRL, structs
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
@@ -16,10 +16,14 @@ from opendbc.car.ford import fordcan
 from opendbc.car.ford.carcontroller import CarController, TransitLkaState
 from opendbc.car.ford.carstate import CarState
 from opendbc.car.ford.interface import CarInterface
-from opendbc.car.ford.values import (CAR, DBC, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes, FordFlags,
+from opendbc.car.ford.human_turn import (HUMAN_TURN_ANGLE_DEG, HUMAN_TURN_HOLD_PRETURNED_S,
+                                         HUMAN_TURN_HOLD_S, HumanTurnDetector)
+from opendbc.car.ford.lane_center_trim import lane_center_trim_for
+from opendbc.car.ford.values import (CAR, CarControllerParams, DBC, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes, FordFlags,
                                      FordSafetyFlags, TRANSIT_LKA_AVAIL_VALUES, TRANSIT_LKA_CONT_ENTER_SPEED,
                                      TRANSIT_LKA_CONT_EXIT_SPEED_HIGH, TRANSIT_LKA_CONT_EXIT_SPEED_LOW,
                                      TRANSIT_LKA_FLAGS_MASK, TransitLkaAvailGate, TransitLkaContinuation,
+                                     TransitHumanTurn, TransitLaneCentering,
                                      TransitLkaDirectionSign, TransitLkaIntervention, TransitLkaRamp,
                                      pack_transit_lka_flags, unpack_transit_lka_flags)
 from opendbc.car.ford.fingerprints import FW_VERSIONS
@@ -528,18 +532,19 @@ class TestTransitLkaSettingsClamp:
 
 
 class TestTransitLkaFlagPacking:
-  """The five switches live in spare bits of upstream's CarParams.flags.
+  """The seven switches live in spare bits of upstream's CarParams.flags.
 
   That keeps this fork's car.capnp byte-identical to upstream - no ordinal to collide on
   a rebase, no chance of decoding recorded logs against a different upstream @78 - at the
   cost of readability, so the layout in ford/values.py has to be exactly right. These
-  tests are what stops a later FordFlags member from silently landing on bits 2-9.
+  tests are what stops a later FordFlags member from silently landing on bits 2-11.
   """
 
   @staticmethod
   def _all_settings():
     return itertools.product(TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign,
-                             TransitLkaAvailGate, TransitLkaContinuation)
+                             TransitLkaAvailGate, TransitLkaContinuation, TransitLaneCentering,
+                             TransitHumanTurn)
 
   def test_every_combination_round_trips(self):
     for combo in self._all_settings():
@@ -561,11 +566,12 @@ class TestTransitLkaFlagPacking:
     # so that ORing card.py's value onto a non-Ford CarParams.flags is a no-op
     assert pack_transit_lka_flags(int(TransitLkaIntervention.STANDARD), int(TransitLkaRamp.SLOW),
                                   int(TransitLkaDirectionSign.POSITIVE_LEFT), int(TransitLkaAvailGate.STANDARD),
-                                  int(TransitLkaContinuation.OFF)) == 0
+                                  int(TransitLkaContinuation.OFF), int(TransitLaneCentering.OFF),
+                                  int(TransitHumanTurn.OFF)) == 0
 
   def test_layout_constants_agree_with_ford_flags(self):
     assert TRANSIT_LKA_FLAGS_MASK & (FordFlags.CANFD | FordFlags.LKA_STEER) == 0
-    assert TRANSIT_LKA_FLAGS_MASK == 0b1111111100  # bits 2-9, as documented in values.py
+    assert TRANSIT_LKA_FLAGS_MASK == 0b111111111100  # bits 2-11, as documented in values.py
 
 
 class TestTransitLkaAvailGate:
@@ -787,3 +793,96 @@ class TestTransitLkaContinuation:
     CarInterface(CP)
     assert CP.flags == before.flags
     assert [c.safetyParam for c in CP.safetyConfigs] == [c.safetyParam for c in before.safetyConfigs]
+
+
+class TestTransitHumanTurn:
+  """Hand lateral back on a sustained driver turn (ported from BluePilot; ford/human_turn.py)."""
+
+  @staticmethod
+  def _controller(on):
+    return _build_transit_controller(pack_transit_lka_flags(0, 0, 0, 0, 0, 0, int(on)))
+
+  def test_off_does_not_construct_it(self):
+    # With the switch off nothing on this path changes: there is no detector to tick.
+    assert self._controller(False).human_turn is None
+
+  def test_on_constructs_it(self):
+    assert self._controller(True).human_turn is not None
+
+  def test_a_deliberate_turn_latches_after_the_short_hold(self):
+    # A real turn starts with the wheel below the threshold and is wound past it, which is
+    # the case HUMAN_TURN_HOLD_S is for.
+    d = HumanTurnDetector()
+    tick_s = CarControllerParams.LKA_STEP * DT_CTRL
+    assert not d.update(True, True, 0.0)
+    angle = HUMAN_TURN_ANGLE_DEG + 10.0
+    for _ in range(int(HUMAN_TURN_HOLD_S / tick_s) - 2):
+      assert not d.update(True, True, angle)
+    for _ in range(3):
+      d.update(True, True, angle)
+    assert d.active
+
+  def test_a_grab_on_an_already_turned_wheel_needs_the_long_hold(self):
+    # The press begins with the wheel already past the threshold, so lateral control had it
+    # turned and this is a mid-curve nudge, not a takeover: the longer hold applies.
+    d = HumanTurnDetector()
+    tick_s = CarControllerParams.LKA_STEP * DT_CTRL
+    angle = HUMAN_TURN_ANGLE_DEG + 10.0
+    for _ in range(int(HUMAN_TURN_HOLD_S / tick_s) + 2):
+      assert not d.update(True, True, angle), "latched at the short hold on a pre-turned wheel"
+    for _ in range(int((HUMAN_TURN_HOLD_PRETURNED_S - HUMAN_TURN_HOLD_S) / tick_s) + 2):
+      d.update(True, True, angle)
+    assert d.active
+
+  def test_the_tick_matches_this_fork_not_the_source(self):
+    # human_turn.py is ticked at LKA_STEP here and at STEER_STEP in BluePilot. The holds are
+    # in seconds, so an unadapted tick would latch 5/3 too early.
+    assert CarControllerParams.LKA_STEP != CarControllerParams.STEER_STEP
+    from opendbc.car.ford import human_turn
+    assert human_turn._STEER_DT == CarControllerParams.LKA_STEP * DT_CTRL
+
+  def test_a_brief_nudge_does_not_latch(self):
+    d = HumanTurnDetector()
+    for _ in range(5):
+      assert not d.update(True, True, HUMAN_TURN_ANGLE_DEG + 10.0)
+    assert not d.update(True, False, HUMAN_TURN_ANGLE_DEG + 10.0)
+
+  def test_angle_alone_does_not_latch(self):
+    # openpilot steering through a curve puts the wheel well past the threshold; without
+    # the driver actually holding it, that must not read as a takeover.
+    d = HumanTurnDetector()
+    for _ in range(200):
+      assert not d.update(True, False, 90.0)
+
+
+class TestTransitLaneCentering:
+  """The trim is only built when its switch asks for it (ford/lane_center_trim.py)."""
+
+  @staticmethod
+  def _cp(on):
+    return CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
+                                   alpha_long=False, is_release=True, docs=False,
+                                   extra_flags=pack_transit_lka_flags(0, 0, 0, 0, 0, int(on), 0))
+
+  def test_off_returns_none(self):
+    assert lane_center_trim_for(self._cp(False)) is None
+
+  def test_on_returns_a_trim(self):
+    assert lane_center_trim_for(self._cp(True)) is not None
+
+  def test_other_brands_never_get_one(self):
+    # controlsd calls this for every car; only Ford may answer.
+    CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
+                                 alpha_long=False, is_release=True, docs=False,
+                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 0, 0, 1, 0))
+    CP.brand = "toyota"
+    assert lane_center_trim_for(CP) is None
+
+  def test_neither_switch_disturbs_the_others(self):
+    for lc in (TransitLaneCentering.OFF, TransitLaneCentering.ON):
+      for ht in (TransitHumanTurn.OFF, TransitHumanTurn.ON):
+        flags = pack_transit_lka_flags(0, 0, 0, 0, 0, int(lc), int(ht))
+        got = unpack_transit_lka_flags(flags)
+        assert got[5] == lc and got[6] == ht
+        # the five earlier switches stay at their defaults
+        assert [int(x) for x in got[:5]] == [0, 0, 0, 0, 0]
