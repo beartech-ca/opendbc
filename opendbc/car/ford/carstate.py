@@ -23,9 +23,7 @@ class CarState(CarStateBase):
     self.distance_button = 0
     self.lc_button = 0
     self.lkas_available = False
-    # Which LaActAvail_D_Actl values count as "LKA offered"; switchable, see values.py
-    self.lkas_avail_values = TRANSIT_LKA_AVAIL_VALUES[unpack_transit_lka_flags(CP.flags)[3]]
-    self.lka_continuation_enabled = unpack_transit_lka_flags(CP.flags)[4] == TransitLkaContinuation.ON
+    self.lka_continuation_enabled = unpack_transit_lka_flags(CP.flags)[2] == TransitLkaContinuation.ON
     self.lka_continuation = False
     self.pcm_cruise_engaged_prev = False
 
@@ -65,12 +63,11 @@ class CarState(CarStateBase):
       # this signal is always 0 on non-CAN FD cars
       ret.steerFaultTemporary |= cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"] not in (1, 2, 3)
 
-    # LaActAvail_D_Actl: 3 "LKA_LCA_LDW_Avail", 2 "LCA_LKA_Avail_LDW_Suppress",
-    # 1 "LCA_LKA_Suppress_LDW_Avail", 0 "LCA_LKA_LDW_Suppress". LKA is offered
-    # in both 3 and 2 - 2 only suppresses the LDW warning. The accepted set is
-    # switchable (TransitLkaAvailGate) so the 1 report, which this Transit's PSCM
-    # sends below roughly 36 km/h, can be commanded through as an experiment.
-    self.lkas_available = cp.vl["Lane_Assist_Data3_FD1"]["LaActAvail_D_Actl"] in self.lkas_avail_values
+    # LKA is offered in 3 and 2 only; in 1 and 0 the PSCM has suppressed it and
+    # commanding anyway both fails to steer and keeps it suppressed. This Transit's PSCM
+    # reports 1 below roughly 36 km/h, which is the real floor of this channel - see
+    # TRANSIT_LKA_AVAIL_VALUES in values.py for the recorded evidence.
+    self.lkas_available = cp.vl["Lane_Assist_Data3_FD1"]["LaActAvail_D_Actl"] in TRANSIT_LKA_AVAIL_VALUES
 
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False

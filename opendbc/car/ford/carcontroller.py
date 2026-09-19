@@ -6,7 +6,7 @@ from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.human_turn import HumanTurnDetector
 from opendbc.car.ford.values import (CarControllerParams, FordFlags, CAR, TransitHumanTurn,
-                                     TransitLkaDirectionSign, TransitLkaIntervention, TransitLkaRamp,
+                                     TransitLkaIntervention, TransitLkaRamp,
                                      unpack_transit_lka_flags)
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -61,13 +61,24 @@ def apply_creep_compensation(accel: float, v_ego: float) -> float:
   return float(accel)
 
 
-# LkaActvStats_D2_Req values, keyed by (direction sign, escalated):
-#   1 IncrLeft, 2 StandLeft, 4 StandRight, 6 IncrRight
+# LkaActvStats_D2_Req values for a (positive request, negative request) pair, keyed by
+# whether the request is escalated: 1 IncrLeft, 2 StandLeft, 4 StandRight, 6 IncrRight.
+#
+# The Left/Right in those names is the side of the lane the van is DEPARTING toward, not
+# the direction of the correction. That is how the stock camera uses it: over the 267
+# frames it asked for anything on 2026-09-18 it sent 4 "StandIntervRight" every time, with
+# the van a median 0.57 m right of the lane centre on 100% of them, and its own
+# LaRefAng_No_Req positive - a leftward correction. A positive request is therefore a
+# response to departing right, and pairs with 4.
+#
+# Which name sat on which sign used to be switchable, and neither position steered
+# measurably better (83.4% of commands followed against 82.9%) because the PSCM follows
+# the sign of LaRefAng_No_Req and does not enforce the code. The pairing is fixed here to
+# the one the module's own camera uses rather than to the one that happened to be the
+# switch's default.
 TRANSIT_LKA_ACTION = {
-  (TransitLkaDirectionSign.POSITIVE_LEFT, False): (2, 4),
-  (TransitLkaDirectionSign.POSITIVE_LEFT, True): (1, 6),
-  (TransitLkaDirectionSign.POSITIVE_RIGHT, False): (4, 2),
-  (TransitLkaDirectionSign.POSITIVE_RIGHT, True): (6, 1),
+  False: (4, 2),
+  True: (6, 1),
 }
 
 
@@ -92,10 +103,9 @@ class TransitLkaState:
   RAMP_EXIT_RATE = 12.0
   RAMP_RATE_TAU = 0.15            # raw demand rate chatters across the band
 
-  def __init__(self, intervention: TransitLkaIntervention, ramp: TransitLkaRamp, direction: TransitLkaDirectionSign):
+  def __init__(self, intervention: TransitLkaIntervention, ramp: TransitLkaRamp):
     self.intervention = intervention
     self.ramp = ramp
-    self.direction = direction
     self.increasing = False
     self.fast = False
     self.rate_filtered = 0.0
@@ -128,9 +138,9 @@ class TransitLkaState:
       self.fast = self.ramp == TransitLkaRamp.FAST
 
     if req_deg > self.DEADBAND_DEG:
-      action = TRANSIT_LKA_ACTION[(self.direction, self.increasing)][0]
+      action = TRANSIT_LKA_ACTION[self.increasing][0]
     elif req_deg < -self.DEADBAND_DEG:
-      action = TRANSIT_LKA_ACTION[(self.direction, self.increasing)][1]
+      action = TRANSIT_LKA_ACTION[self.increasing][1]
     else:
       action = 0
 
@@ -156,15 +166,14 @@ class CarController(CarControllerBase):
 
     self.transit_lka = None
     if CP.flags & FordFlags.LKA_STEER:
-      # the three A/B switches ride in spare CarParams.flags bits; see ford/values.py
-      # the fourth setting (availability gate) is CarState's, not the controller's
-      self.transit_lka = TransitLkaState(*unpack_transit_lka_flags(CP.flags)[:3])
+      # the A/B switches ride in spare CarParams.flags bits; see ford/values.py
+      self.transit_lka = TransitLkaState(*unpack_transit_lka_flags(CP.flags)[:2])
       self.desired_angle_last = 0.0
       self.lka_active_last = False
       # Human-turn override (ported from BluePilot; see ford/human_turn.py). Constructed only
       # when the switch is on, so with it off nothing about this path changes.
       self.human_turn = (HumanTurnDetector()
-                         if unpack_transit_lka_flags(CP.flags)[6] == TransitHumanTurn.ON else None)
+                         if unpack_transit_lka_flags(CP.flags)[4] == TransitHumanTurn.ON else None)
       self.human_turn_active = False
 
   def update(self, CC, CS, now_nanos):

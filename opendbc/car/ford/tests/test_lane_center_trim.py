@@ -6,7 +6,10 @@ and their numbers are unchanged. They drive the class directly against a minimal
 modelV2-shaped stub, so they run without openpilot.
 """
 
-from opendbc.car.ford.lane_center_trim import LaneCenterTrim, _CORRECTION_ROC_PER_TICK
+import pytest
+
+from opendbc.car.ford.lane_center_trim import (LaneCenterTrim, MODEL_ASSUMED_HEIGHT_M,
+                                               _CORRECTION_ROC_PER_TICK)
 
 
 class _XY:
@@ -266,3 +269,50 @@ class TestLaneCenterTrim:
     self.trim.reset()
     self._run(b, offset=0.3, gain=1.0, iterations=500)
     assert abs((self.trim.correction) - (correction_a)) < 1e-9
+
+
+class TestCompressedWidth:
+  """A camera mounted higher than the model's scale assumes makes every reported lane narrow.
+
+  modeld warps the model's input for rotation only - get_view_frame_from_calib_frame(r, p, y, 0)
+  - so the calibrated height is never applied and ground distances come back scaled by
+  MODEL_ASSUMED_HEIGHT_M / actual_height. On the Transit this fork targets that is about 0.81,
+  and a 3.3 m lane arrives as 2.7 m, which is under the width-tolerance ramp's 0.6 crossing at
+  2.696 m. Across three recorded drives the blend returned scale 0 on 72-84% of frames, so the
+  trim was silently disabled on exactly the vehicle it was written for.
+  """
+
+  @staticmethod
+  def _scale(trim, width):
+    return trim._laneline_blend(_good_model(width=width), 20.0)[0]
+
+  def test_a_compressed_lane_is_rejected_when_the_height_is_unknown(self):
+    # the shipped behaviour: 3.3 m of real lane seen from 1.51 m arrives as 2.67 m
+    trim = LaneCenterTrim()
+    assert self._scale(trim, 3.3 * MODEL_ASSUMED_HEIGHT_M / 1.51) == 0.0
+
+  def test_the_same_lane_is_trusted_once_calibration_reports_the_height(self):
+    trim = LaneCenterTrim()
+    trim.set_camera_height(1.51)
+    assert self._scale(trim, 3.3 * MODEL_ASSUMED_HEIGHT_M / 1.51) == pytest.approx(1.0)
+
+  def test_a_genuinely_narrow_lane_is_still_rejected(self):
+    # the gate must keep working: 2.3 m of real lane is not a lane to sit between
+    trim = LaneCenterTrim()
+    trim.set_camera_height(1.51)
+    assert self._scale(trim, 2.3 * MODEL_ASSUMED_HEIGHT_M / 1.51) == 0.0
+
+  def test_the_default_height_changes_nothing(self):
+    trim = LaneCenterTrim()
+    before = self._scale(trim, 3.7)
+    trim.set_camera_height(MODEL_ASSUMED_HEIGHT_M)
+    assert self._scale(trim, 3.7) == before
+
+  @pytest.mark.parametrize("bad", (0.0, -1.0, 4.0, float("nan"), None, "x"))
+  def test_an_unbelievable_height_falls_back_instead_of_scaling(self, bad):
+    """A calibration that has not converged must not widen the gate by an arbitrary factor."""
+    trim = LaneCenterTrim()
+    trim.set_camera_height(1.51)
+    trim.set_camera_height(bad)
+    assert self._scale(trim, 3.7) == pytest.approx(self._scale(LaneCenterTrim(), 3.7))
+

@@ -36,15 +36,31 @@ from numpy import interp
 
 from opendbc.car.ford.values import TransitLaneCentering, unpack_transit_lka_flags
 
-# BluePilot's shipped defaults for the two tunables. Kept as constants rather than params:
-# the switch is the A/B control this fork needs first, and a second and third knob would have
-# to be tuned against drive data that does not exist yet.
-DEFAULT_OFFSET_M = 0.0    # positive shifts the target right
-DEFAULT_STRENGTH = 0.25   # fraction of the clipped raw correction actually applied
+# Ranges for the two driver-set values, shared with the settings widget and re-applied by
+# the caller, since Params can be edited by hand and these reach the controller.
+OFFSET_LIMIT_M = 0.5   # metres; negative is left, positive is right
+STRENGTH_LIMIT = 1.0   # fraction of the clipped raw correction actually applied
+
+# The camera height the model's spatial scale is implicitly trained at, which is also
+# calibrationd's HEIGHT_INIT. modeld never applies the calibrated height: the warp it feeds the
+# model is get_view_frame_from_calib_frame(roll, pitch, yaw, 0), so rotation is corrected and
+# height is not. Ground distances scale linearly with camera height, so a device mounted higher
+# than this makes the model under-report every lateral and longitudinal distance by
+# MODEL_ASSUMED_HEIGHT_M / actual_height.
+#
+# On this Transit that ratio is about 0.81 (calibration converges to 1.51-1.55 m), and the effect
+# is measurable: a lane the owner reports as at least 3.3 m wide comes back as 2.58-2.70 m. That
+# lands on the bottom of the width-tolerance ramp below, whose 0.6 crossing sits at 2.696 m, so
+# the blend scored these lane lines as untrustworthy and returned scale 0 on 72-84% of frames
+# across three recorded drives - switching off the one mechanism that could correct the bias it
+# exists to correct. The widths are therefore compared in the model's own compressed metric.
+MODEL_ASSUMED_HEIGHT_M = 1.22
+_HEIGHT_RANGE_M = (0.8, 2.5)   # outside this a calibration is not believable; fall back to no scaling
 
 # Laneline confidence blend -- ported verbatim from lateral_curv_ext.py's path_offset blend
 # (laneline_width_tolerance / min_laneline_confidence_bp) so both control schemes agree on what
-# "good lane lines" means.
+# "good lane lines" means. Breakpoints are true metres; _width_scale() brings the model's
+# reported width into the same units before they are used.
 _WIDTH_TOLERANCE_BP = (2.4, 2.8, 3.75, 4.25)  # m - the floor is added from StarPilot
 _WIDTH_TOLERANCE_V = (0.0, 0.81, 0.81, 0.59) # Adds StarPilot's low edge
 _STD_TOLERANCE_BP = (0.3, 0.5) #0.3 is from StarPilot to define bad references
@@ -84,6 +100,8 @@ _CORRECTION_ROC_PER_TICK = 0.00015
 class LaneCenterTrim:
   def __init__(self):
     self._correction = 0.0
+    # Until calibration says otherwise, assume the model's own height, i.e. no width scaling.
+    self._camera_height = MODEL_ASSUMED_HEIGHT_M
 
   def reset(self) -> None:
     self._correction = 0.0
@@ -162,6 +180,25 @@ class LaneCenterTrim:
     raw = 2.0 * error / (lookahead ** 2)
     return True, float(raw)
 
+  def set_camera_height(self, height_m: float) -> None:
+    """Tell the trim what calibration believes the camera height is, in metres.
+
+    Only the width comparison uses it. The correction itself is still computed from the model's
+    compressed distances, which makes it about 1/scale too large; DEFAULT_STRENGTH is the knob
+    that absorbs that, and splitting the two would mean re-tuning the strength at the same time.
+    """
+    try:
+      h = float(height_m)
+    except (TypeError, ValueError):
+      h = float("nan")
+    # One rule: scale only on a height we can believe, otherwise do not scale at all. A NaN
+    # fails both comparisons, so an unconverged or malformed calibration lands here too.
+    self._camera_height = h if _HEIGHT_RANGE_M[0] <= h <= _HEIGHT_RANGE_M[1] else MODEL_ASSUMED_HEIGHT_M
+
+  def _width_scale(self) -> float:
+    """What the model reports divided by what is really there, from the height ratio."""
+    return MODEL_ASSUMED_HEIGHT_M / self._camera_height
+
   def _laneline_blend(self, model, lookahead: float) -> tuple[float, float]:
     """Returns (scale, laneline_center_y). scale=0 whenever lanelines can't be trusted (missing,
     low-probability, structurally invalid) -- center_y is unused/meaningless in that case since
@@ -194,7 +231,7 @@ class LaneCenterTrim:
       # (penalizes implausibly wide/merging-looking detections) combined with per-line
       # probability via min() -- a single missing/unreliable line (e.g. no line on the curb
       # side, only a center stripe) drags confidence toward 0 on its own.
-      width_tolerance = float(np.interp(width, _WIDTH_TOLERANCE_BP, _WIDTH_TOLERANCE_V))
+      width_tolerance = float(np.interp(width / self._width_scale(), _WIDTH_TOLERANCE_BP, _WIDTH_TOLERANCE_V))
       # StarPilot stopped at 0.3; this fades the std through the table instead.
       std_tolerance = float(np.interp(max(float(stds[1]), float(stds[2])),
                                       _STD_TOLERANCE_BP, _STD_TOLERANCE_V))
@@ -214,6 +251,6 @@ def lane_center_trim_for(CP):
   """
   if CP.brand != "ford":
     return None
-  if unpack_transit_lka_flags(CP.flags)[5] != TransitLaneCentering.ON:
+  if unpack_transit_lka_flags(CP.flags)[3] != TransitLaneCentering.ON:
     return None
   return LaneCenterTrim()

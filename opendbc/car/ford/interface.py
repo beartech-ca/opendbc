@@ -61,7 +61,7 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LKA_STEER.value
       # Mirrors panda's own gate: ford_lka_continuation_enabled is ford_lka_steer AND the
       # flag (safety/modes/ford.h). The switch reaches here through get_params' extra_flags.
-      if unpack_transit_lka_flags(ret.flags)[4] == TransitLkaContinuation.ON:
+      if unpack_transit_lka_flags(ret.flags)[2] == TransitLkaContinuation.ON:
         ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LKA_CONTINUATION.value
 
     if ret.flags & FordFlags.CANFD:

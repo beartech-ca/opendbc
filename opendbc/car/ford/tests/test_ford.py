@@ -18,13 +18,14 @@ from opendbc.car.ford.carstate import CarState
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.human_turn import (HUMAN_TURN_ANGLE_DEG, HUMAN_TURN_HOLD_PRETURNED_S,
                                          HUMAN_TURN_HOLD_S, HumanTurnDetector)
-from opendbc.car.ford.lane_center_trim import lane_center_trim_for
+from opendbc.car.ford.lane_center_trim import (LaneCenterTrim, OFFSET_LIMIT_M, STRENGTH_LIMIT,
+                                               lane_center_trim_for)
 from opendbc.car.ford.values import (CAR, CarControllerParams, DBC, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes, FordFlags,
                                      FordSafetyFlags, TRANSIT_LKA_AVAIL_VALUES, TRANSIT_LKA_CONT_ENTER_SPEED,
                                      TRANSIT_LKA_CONT_EXIT_SPEED_HIGH, TRANSIT_LKA_CONT_EXIT_SPEED_LOW,
-                                     TRANSIT_LKA_FLAGS_MASK, TransitLkaAvailGate, TransitLkaContinuation,
+                                     TRANSIT_LKA_FLAGS_MASK, TransitLkaContinuation,
                                      TransitHumanTurn, TransitLaneCentering,
-                                     TransitLkaDirectionSign, TransitLkaIntervention, TransitLkaRamp,
+                                     TransitLkaIntervention, TransitLkaRamp,
                                      pack_transit_lka_flags, unpack_transit_lka_flags)
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
@@ -342,60 +343,72 @@ class TestTransitLateralMotionControlHeartbeat:
 
 class TestTransitLkaIntervention:
   def test_standard_position_never_escalates(self):
-    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.SLOW, TransitLkaDirectionSign.POSITIVE_LEFT)
+    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.SLOW)
     action, _ = s.update(9.0, 12.0, 0.0)
-    assert action == 2
+    assert action == 4  # a standing code, not the escalated 6, for this request sign
 
   def test_increasing_position_always_escalates(self):
-    s = TransitLkaState(TransitLkaIntervention.INCREASING, TransitLkaRamp.SLOW, TransitLkaDirectionSign.POSITIVE_LEFT)
+    s = TransitLkaState(TransitLkaIntervention.INCREASING, TransitLkaRamp.SLOW)
     action, _ = s.update(0.5, 0.5, 0.0)
-    assert action == 1
+    assert action == 6  # escalated, on the side a positive request pairs with
 
   def test_preset_latches_on_both_conditions(self):
-    s = TransitLkaState(TransitLkaIntervention.PRESET, TransitLkaRamp.SLOW, TransitLkaDirectionSign.POSITIVE_LEFT)
-    assert s.update(5.5, 4.0, 0.0)[0] == 2      # req high, desired low -> no
-    assert s.update(4.0, 6.0, 0.0)[0] == 2      # desired high, req low -> no
-    assert s.update(5.5, 6.0, 0.0)[0] == 1      # both -> escalate
-    assert s.update(4.8, 5.0, 0.0)[0] == 1      # inside the hysteresis band -> hold
-    assert s.update(4.5, 4.7, 0.0)[0] == 2      # both below exit -> release
+    s = TransitLkaState(TransitLkaIntervention.PRESET, TransitLkaRamp.SLOW)
+    # a positive request, so the standing code is 4 and the escalated one 6
+    assert s.update(5.5, 4.0, 0.0)[0] == 4      # req high, desired low -> no
+    assert s.update(4.0, 6.0, 0.0)[0] == 4      # desired high, req low -> no
+    assert s.update(5.5, 6.0, 0.0)[0] == 6      # both -> escalate
+    assert s.update(4.8, 5.0, 0.0)[0] == 6      # inside the hysteresis band -> hold
+    assert s.update(4.5, 4.7, 0.0)[0] == 4      # both below exit -> release
 
 
 class TestTransitLkaRamp:
   def test_preset_enters_on_angle(self):
-    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.PRESET, TransitLkaDirectionSign.POSITIVE_LEFT)
+    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.PRESET)
     assert s.update(1.0, 1.0, 0.0)[1] == 0
     assert s.update(1.9, 1.9, 0.0)[1] == 1
 
   def test_preset_enters_on_demand_rate_after_the_filter_settles(self):
-    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.PRESET, TransitLkaDirectionSign.POSITIVE_LEFT)
+    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.PRESET)
     for _ in range(40):
       out = s.update(0.2, 0.2, 40.0)
     assert out[1] == 1
 
   def test_filter_rejects_a_single_rate_spike(self):
-    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.PRESET, TransitLkaDirectionSign.POSITIVE_LEFT)
+    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.PRESET)
     assert s.update(0.2, 0.2, 60.0)[1] == 0
 
   def test_preset_holds_inside_the_band(self):
-    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.PRESET, TransitLkaDirectionSign.POSITIVE_LEFT)
+    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.PRESET)
     s.update(2.0, 2.0, 0.0)
     assert s.update(1.6, 1.6, 0.0)[1] == 1
     assert s.update(1.4, 1.4, 0.0)[1] == 0
 
 
-class TestTransitLkaDirectionSign:
-  def test_positive_left(self):
-    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.SLOW, TransitLkaDirectionSign.POSITIVE_LEFT)
-    assert s.update(1.0, 1.0, 0.0)[0] == 2
-    assert s.update(-1.0, -1.0, 0.0)[0] == 4
+class TestTransitLkaActionPairing:
+  """Which LkaActvStats_D2_Req code goes with which sign of the request.
 
-  def test_positive_right(self):
-    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.SLOW, TransitLkaDirectionSign.POSITIVE_RIGHT)
+  The code names the side the van is departing toward, not the direction of the
+  correction, so a positive (leftward) request pairs with a "Right" code. That is what the
+  stock camera does: on every frame it asked for an intervention it sent 4
+  "StandIntervRight" while the van sat right of the lane centre and its own
+  LaRefAng_No_Req was positive. This was once a switch, and neither position steered
+  measurably better, so the pairing is fixed to the stock one rather than to the switch's
+  old default. These tests hold it in place.
+  """
+
+  def test_a_leftward_request_is_a_rightward_departure(self):
+    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.SLOW)
     assert s.update(1.0, 1.0, 0.0)[0] == 4
     assert s.update(-1.0, -1.0, 0.0)[0] == 2
 
+  def test_escalated_pairing_keeps_the_same_sides(self):
+    s = TransitLkaState(TransitLkaIntervention.INCREASING, TransitLkaRamp.SLOW)
+    assert s.update(1.0, 1.0, 0.0)[0] == 6
+    assert s.update(-1.0, -1.0, 0.0)[0] == 1
+
   def test_deadband_gives_no_intervention(self):
-    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.SLOW, TransitLkaDirectionSign.POSITIVE_LEFT)
+    s = TransitLkaState(TransitLkaIntervention.STANDARD, TransitLkaRamp.SLOW)
     assert s.update(0.05, 0.05, 0.0)[0] == 0
 
 
@@ -427,8 +440,8 @@ class TestTransitLkaParamsPlumbing:
     # TransitLkaIntervention.INCREASING, packed and ORed onto CP.flags the same way card.py and
     # get_car do, must flip the action the CarController's TransitLkaState emits. If pack
     # or unpack is broken this falls back to TransitLkaIntervention.STANDARD and the assert fails.
-    cc = _build_transit_controller(pack_transit_lka_flags(int(TransitLkaIntervention.INCREASING), int(TransitLkaRamp.SLOW),
-                                                          int(TransitLkaDirectionSign.POSITIVE_LEFT)))
+    cc = _build_transit_controller(pack_transit_lka_flags(int(TransitLkaIntervention.INCREASING),
+                                                          int(TransitLkaRamp.SLOW)))
 
     action, _ = cc.transit_lka.update(1.0, 1.0, 0.0)
     assert action in (1, 6)
@@ -440,14 +453,14 @@ class TestTransitLkaParamsPlumbing:
 
   def test_default_setting_reproduces_todays_behaviour(self):
     # No extra flags (the default every other get_car caller still uses) must reproduce
-    # the shipped baseline: TransitLkaIntervention.STANDARD, action 2/4.
+    # the shipped baseline: TransitLkaIntervention.STANDARD, the standing codes 4/2.
     cc = _build_transit_controller()
 
     action, _ = cc.transit_lka.update(1.0, 1.0, 0.0)
-    assert action == 2
+    assert action == 4
 
     action, _ = cc.transit_lka.update(-1.0, -1.0, 0.0)
-    assert action == 4
+    assert action == 2
 
 
 class TestLkaMsgStaysEmptyForEveryOtherFord:
@@ -490,21 +503,17 @@ class TestTransitLkaSettingsClamp:
   The Params are plain integers, so a value outside each enum's range reaches pack_transit_lka_flags
   and, if it survived, CarController.__init__. A raised ValueError there kills card,
   manager restarts it, and openpilot is unusable until the param is corrected over SSH.
-  These switches deliberately ship with no UI, so hand-editing the params is the only
-  way to use them and a typo is the expected interaction, not an exotic one.
-
-  The clamp runs on both sides of the bit field: direction sign owns a single bit, so
-  7 would otherwise pack down to a valid-looking POSITIVE_RIGHT rather than fall back.
+  The clamp runs on both sides of the bit field: the single-bit switches would otherwise
+  let a typo pack down to a valid-looking non-default value rather than fall back.
   """
 
   @pytest.mark.parametrize(("index", "attr", "default"), [
     (0, "intervention", TransitLkaIntervention.STANDARD),
     (1, "ramp", TransitLkaRamp.SLOW),
-    (2, "direction", TransitLkaDirectionSign.POSITIVE_LEFT),
   ])
   def test_out_of_range_value_falls_back_to_the_default(self, index, attr, default):
-    settings = [0, 0, 0, 0]
-    settings[index] = 7  # a plausible typo, outside every one of the three enums
+    settings = [0, 0]
+    settings[index] = 7  # a plausible typo, outside both enums
     cc = _build_transit_controller(pack_transit_lka_flags(*settings))
     assert getattr(cc.transit_lka, attr) == default
 
@@ -515,24 +524,22 @@ class TestTransitLkaSettingsClamp:
   def test_out_of_range_raw_bits_fall_back_to_the_default(self, index, attr, default):
     # the two-bit fields can hold 3, which is outside TransitLkaIntervention and TransitLkaRamp; unpack must
     # clamp that too rather than trust whatever produced the flags
-    raw = [0, 0, 0, 0]
+    raw = [0, 0, 0]
     raw[index] = 3
-    flags = (raw[0] << 2) | (raw[1] << 4) | (raw[2] << 6) | (raw[3] << 7)
+    flags = (raw[0] << 2) | (raw[1] << 4) | (raw[2] << 6)
     cc = _build_transit_controller(flags)
     assert getattr(cc.transit_lka, attr) == default
 
   def test_in_range_values_are_still_honoured(self):
     # the clamp must not swallow a valid non-default setting
-    cc = _build_transit_controller(pack_transit_lka_flags(int(TransitLkaIntervention.PRESET), int(TransitLkaRamp.FAST),
-                                                          int(TransitLkaDirectionSign.POSITIVE_RIGHT),
-                                                          int(TransitLkaAvailGate.PERMISSIVE)))
+    cc = _build_transit_controller(pack_transit_lka_flags(int(TransitLkaIntervention.PRESET),
+                                                          int(TransitLkaRamp.FAST)))
     assert cc.transit_lka.intervention == TransitLkaIntervention.PRESET
     assert cc.transit_lka.ramp == TransitLkaRamp.FAST
-    assert cc.transit_lka.direction == TransitLkaDirectionSign.POSITIVE_RIGHT
 
 
 class TestTransitLkaFlagPacking:
-  """The seven switches live in spare bits of upstream's CarParams.flags.
+  """The five switches live in spare bits of upstream's CarParams.flags.
 
   That keeps this fork's car.capnp byte-identical to upstream - no ordinal to collide on
   a rebase, no chance of decoding recorded logs against a different upstream @78 - at the
@@ -542,9 +549,8 @@ class TestTransitLkaFlagPacking:
 
   @staticmethod
   def _all_settings():
-    return itertools.product(TransitLkaIntervention, TransitLkaRamp, TransitLkaDirectionSign,
-                             TransitLkaAvailGate, TransitLkaContinuation, TransitLaneCentering,
-                             TransitHumanTurn)
+    return itertools.product(TransitLkaIntervention, TransitLkaRamp, TransitLkaContinuation,
+                             TransitLaneCentering, TransitHumanTurn)
 
   def test_every_combination_round_trips(self):
     for combo in self._all_settings():
@@ -565,7 +571,6 @@ class TestTransitLkaFlagPacking:
   def test_defaults_pack_to_zero(self):
     # so that ORing card.py's value onto a non-Ford CarParams.flags is a no-op
     assert pack_transit_lka_flags(int(TransitLkaIntervention.STANDARD), int(TransitLkaRamp.SLOW),
-                                  int(TransitLkaDirectionSign.POSITIVE_LEFT), int(TransitLkaAvailGate.STANDARD),
                                   int(TransitLkaContinuation.OFF), int(TransitLaneCentering.OFF),
                                   int(TransitHumanTurn.OFF)) == 0
 
@@ -574,66 +579,62 @@ class TestTransitLkaFlagPacking:
     assert TRANSIT_LKA_FLAGS_MASK == 0b111111111100  # bits 2-11, as documented in values.py
 
 
-class TestTransitLkaAvailGate:
-  """The switch that decides which LaActAvail_D_Actl reports count as "LKA offered".
+class TestTransitLkaAvailability:
+  """LKA is commanded only where the PSCM says it is offering it.
 
-  Below roughly 36 km/h this Transit's PSCM reports 1 (LCA_LKA_Suppress_LDW_Avail),
-  so openpilot stops commanding and a lowered min-speed calibration would be
-  invisible from the car's side whether or not it took effect. PERMISSIVE commands
-  through that report so the two can be told apart on the road.
+  LaActAvail_D_Actl 3 "LKA_LCA_LDW_Avail" and 2 "LCA_LKA_Avail_LDW_Suppress" offer LKA;
+  1 "LCA_LKA_Suppress_LDW_Avail" and 0 "LCA_LKA_LDW_Suppress" are the PSCM reporting it
+  suppressed. This was a switch whose other two positions commanded through 1 and 0, on
+  the theory that the report might be advisory. The 2026-09-18 drive settled it: over
+  7843 commanded frames in the suppressed state the wheel moved a median of 0.00 deg and
+  followed the commanded direction 41.9% of the time, and commanding there kept the PSCM
+  suppressed for the rest of the engagement. The switch is gone; these tests hold the
+  remaining behaviour in place.
   """
 
+  def test_only_the_reports_that_offer_lka_are_accepted(self):
+    assert TRANSIT_LKA_AVAIL_VALUES == (2, 3)
+
   @staticmethod
-  def _carstate(gate):
-    candidate = CAR.FORD_TRANSIT_MK5
-    CP = CarInterface.get_params(candidate, {0: {0x176: 8}, 2: {}}, [], alpha_long=False, is_release=True,
-                                 docs=False, extra_flags=pack_transit_lka_flags(0, 0, 0, int(gate)))
-    return CarState(CP)
+  def _lane_assist_data1_while(available):
+    """Run the real controller and return what Lane_Assist_Data1 (0x3CA) actually carried.
 
-  @pytest.mark.parametrize(("gate", "expected"), [
-    (TransitLkaAvailGate.STANDARD, (2, 3)),
-    (TransitLkaAvailGate.PERMISSIVE, (1, 2, 3)),
-    (TransitLkaAvailGate.ANY, (0, 1, 2, 3)),
-  ])
-  def test_each_position_accepts_its_own_reports(self, gate, expected):
-    assert self._carstate(gate).lkas_avail_values == expected
-
-  def test_default_is_unchanged_from_the_shipped_behaviour(self):
-    # no extra flags at all is what every other caller produces
-    candidate = CAR.FORD_TRANSIT_MK5
-    CP = CarInterface.get_params(candidate, {0: {0x176: 8}, 2: {}}, [], alpha_long=False, is_release=True, docs=False)
-    assert CarState(CP).lkas_avail_values == (2, 3)
-
-  @pytest.mark.parametrize(("gate", "steers_on_1"), [
-    (TransitLkaAvailGate.STANDARD, False),
-    (TransitLkaAvailGate.PERMISSIVE, True),
-  ])
-  def test_a_suppressed_report_reaches_the_wire_only_when_permitted(self, gate, steers_on_1):
-    """End to end: the gate decides whether a real steering command goes out on 0x3CA.
-
-    TRANSIT_LKA_AVAIL_VALUES alone proves nothing - what matters is that
-    CarController stops zeroing the frame, since lka_active is what forces
-    LaRefAng_No_Req and LkaActvStats_D2_Req to zero.
+    Asserting on TRANSIT_LKA_AVAIL_VALUES alone would prove nothing: what matters is that
+    CarController zeroes the frame, since lka_active is what forces LaRefAng_No_Req and
+    LkaActvStats_D2_Req to zero.
     """
-    accepted = TRANSIT_LKA_AVAIL_VALUES[gate]
-    assert (1 in accepted) == steers_on_1
+    CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
+                                 alpha_long=False, is_release=True, docs=False,
+                                 extra_flags=pack_transit_lka_flags(0, 0))
+    car_interface = CarInterface(CP)
+    car_interface.update([])
+    car_interface.CS.lkas_available = available
 
-    packer = CANPacker("ford_lincoln_base_pt")
-    CAN = fordcan.CanBus(None, {0: {}})
+    CC = structs.CarControl()
+    CC.enabled = True
+    CC.latActive = True
+    CC.actuators.steeringAngleDeg = 4.0
+    CC = CC.as_reader()
 
-    # carcontroller: lka_active false means angle 0 and action 0 regardless of the plan
-    lka_active = steers_on_1
-    apply_angle = 3.0 if lka_active else 0.0
-    action = 2 if lka_active else 0
-    addr, dat, _bus = fordcan.create_transit_lka_msg(packer, CAN, lka_active, apply_angle, action, 0)
+    seen = []
+    for i in range(20):
+      _, can_sends = car_interface.apply(CC, i)
+      for addr, dat, _bus in can_sends:
+        if addr == 0x3CA:
+          seen.append(TestTransitLkaMessage._decode_lane_assist_data1(addr, dat))
+    assert seen, "Lane_Assist_Data1 was never sent"
+    return seen
 
-    vals = TestTransitLkaMessage._decode_lane_assist_data1(addr, dat)
-    if steers_on_1:
-      assert vals["LkaActvStats_D2_Req"] == 2
-      assert math.isclose(vals["LaRefAng_No_Req"], math.radians(apply_angle) * 1000.0, abs_tol=0.05)
-    else:
-      assert vals["LkaActvStats_D2_Req"] == 0
-      assert vals["LaRefAng_No_Req"] == 0.0
+  def test_a_suppressed_pscm_gets_an_empty_frame(self):
+    for v in self._lane_assist_data1_while(False):
+      assert v["LkaActvStats_D2_Req"] == 0
+      assert v["LaRefAng_No_Req"] == 0.0
+
+  def test_an_offering_pscm_gets_the_request(self):
+    # proves the test above is not vacuous - the identical command goes out normally
+    seen = self._lane_assist_data1_while(True)
+    assert any(v["LkaActvStats_D2_Req"] != 0 for v in seen)
+    assert any(abs(v["LaRefAng_No_Req"]) > 1.0 for v in seen)
 
 
 class TestTransitLkaContinuation:
@@ -650,7 +651,7 @@ class TestTransitLkaContinuation:
   def _carstate(on):
     CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
                                  alpha_long=False, is_release=True, docs=False,
-                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 0,
+                                 extra_flags=pack_transit_lka_flags(0, 0,
                                    int(TransitLkaContinuation.ON if on else TransitLkaContinuation.OFF)))
     return CarState(CP)
 
@@ -725,7 +726,7 @@ class TestTransitLkaContinuation:
     """Run the real controller and return what ACCDATA (0x186) actually carried."""
     CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
                                  alpha_long=False, is_release=True, docs=False,
-                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 0, int(TransitLkaContinuation.ON)))
+                                 extra_flags=pack_transit_lka_flags(0, 0, int(TransitLkaContinuation.ON)))
     assert CP.openpilotLongitudinalControl, "precondition: this platform runs openpilot long"
     car_interface = CarInterface(CP)
     car_interface.update([])
@@ -775,7 +776,7 @@ class TestTransitLkaContinuation:
     for on, expected in ((False, False), (True, True)):
       CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
                                    alpha_long=False, is_release=True, docs=False,
-                                   extra_flags=pack_transit_lka_flags(0, 0, 0, 0, int(on)))
+                                   extra_flags=pack_transit_lka_flags(0, 0, int(on)))
       got = bool(CP.safetyConfigs[-1].safetyParam & FordSafetyFlags.LKA_CONTINUATION)
       assert got is expected
 
@@ -788,7 +789,7 @@ class TestTransitLkaContinuation:
     written to CarParams outside get_params."""
     CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
                                  alpha_long=False, is_release=True, docs=False,
-                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 0, int(TransitLkaContinuation.ON)))
+                                 extra_flags=pack_transit_lka_flags(0, 0, int(TransitLkaContinuation.ON)))
     before = copy.deepcopy(CP)
     CarInterface(CP)
     assert CP.flags == before.flags
@@ -800,7 +801,7 @@ class TestTransitHumanTurn:
 
   @staticmethod
   def _controller(on):
-    return _build_transit_controller(pack_transit_lka_flags(0, 0, 0, 0, 0, 0, int(on)))
+    return _build_transit_controller(pack_transit_lka_flags(0, 0, 0, 0, int(on)))
 
   def test_off_does_not_construct_it(self):
     # With the switch off nothing on this path changes: there is no detector to tick.
@@ -862,7 +863,7 @@ class TestTransitLaneCentering:
   def _cp(on):
     return CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
                                    alpha_long=False, is_release=True, docs=False,
-                                   extra_flags=pack_transit_lka_flags(0, 0, 0, 0, 0, int(on), 0))
+                                   extra_flags=pack_transit_lka_flags(0, 0, 0, int(on), 0))
 
   def test_off_returns_none(self):
     assert lane_center_trim_for(self._cp(False)) is None
@@ -874,15 +875,27 @@ class TestTransitLaneCentering:
     # controlsd calls this for every car; only Ford may answer.
     CP = CarInterface.get_params(CAR.FORD_TRANSIT_MK5, {0: {0x176: 8}, 2: {}}, [],
                                  alpha_long=False, is_release=True, docs=False,
-                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 0, 0, 1, 0))
+                                 extra_flags=pack_transit_lka_flags(0, 0, 0, 1, 0))
     CP.brand = "toyota"
     assert lane_center_trim_for(CP) is None
 
   def test_neither_switch_disturbs_the_others(self):
     for lc in (TransitLaneCentering.OFF, TransitLaneCentering.ON):
       for ht in (TransitHumanTurn.OFF, TransitHumanTurn.ON):
-        flags = pack_transit_lka_flags(0, 0, 0, 0, 0, int(lc), int(ht))
+        flags = pack_transit_lka_flags(0, 0, 0, int(lc), int(ht))
         got = unpack_transit_lka_flags(flags)
-        assert got[5] == lc and got[6] == ht
-        # the five earlier switches stay at their defaults
-        assert [int(x) for x in got[:5]] == [0, 0, 0, 0, 0]
+        assert got[3] == lc and got[4] == ht
+        # the three earlier switches stay at their defaults
+        assert [int(x) for x in got[:3]] == [0, 0, 0]
+
+  def test_the_two_values_have_ranges_the_ui_and_controller_share(self):
+    # controlsd re-clamps to these because Params are hand-editable and reach the
+    # controller; the settings widget uses the same constants so the two cannot drift.
+    assert OFFSET_LIMIT_M > 0.0
+    assert STRENGTH_LIMIT > 0.0
+    trim = LaneCenterTrim()
+    model = None
+    # An out-of-range or non-finite value must not produce a correction.
+    for bad in (float("nan"), float("inf"), 1e9):
+      assert trim.update(0.01, model, 20.0, True, bad, 0.5, True, False) == 0.01
+      assert trim.update(0.01, model, 20.0, True, 0.0, bad, True, False) == 0.01
