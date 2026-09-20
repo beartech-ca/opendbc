@@ -315,4 +315,3 @@ class TestCompressedWidth:
     trim.set_camera_height(1.51)
     trim.set_camera_height(bad)
     assert self._scale(trim, 3.7) == pytest.approx(self._scale(LaneCenterTrim(), 3.7))
-

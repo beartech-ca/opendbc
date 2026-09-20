@@ -41,6 +41,12 @@ from opendbc.car.ford.values import TransitLaneCentering, unpack_transit_lka_fla
 OFFSET_LIMIT_M = 0.5   # metres; negative is left, positive is right
 STRENGTH_LIMIT = 1.0   # fraction of the clipped raw correction actually applied
 
+# The shipped values, and what the settings screen offers to go back to. These are the
+# single source of truth: common/params_keys.h must declare the same two numbers as the
+# params' defaults, since that is what a device with no stored value reads.
+DEFAULT_OFFSET_M = 0.0     # centred; a deliberate bias is a tuning decision, not a default
+DEFAULT_STRENGTH = 0.25    # a quarter of the correction the limits already allow
+
 # The camera height the model's spatial scale is implicitly trained at, which is also
 # calibrationd's HEIGHT_INIT. modeld never applies the calibrated height: the warp it feeds the
 # model is get_view_frame_from_calib_frame(roll, pitch, yaw, 0), so rotation is corrected and
@@ -184,8 +190,8 @@ class LaneCenterTrim:
     """Tell the trim what calibration believes the camera height is, in metres.
 
     Only the width comparison uses it. The correction itself is still computed from the model's
-    compressed distances, which makes it about 1/scale too large; DEFAULT_STRENGTH is the knob
-    that absorbs that, and splitting the two would mean re-tuning the strength at the same time.
+    compressed distances, which makes it about 1/scale too large; the strength setting is the
+    knob that absorbs that, and splitting the two would mean re-tuning the strength as well.
     """
     try:
       h = float(height_m)
