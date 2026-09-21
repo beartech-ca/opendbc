@@ -11,7 +11,8 @@ import pytest
 from opendbc.car import DT_CTRL
 
 from opendbc.car.ford.lane_center_trim import (LaneCenterTrim, MODEL_ASSUMED_HEIGHT_M,
-                                               _CORRECTION_ROC_PER_S, _INTEGRAL_LIMIT)
+                                               _CORRECTION_ROC_PER_S, _INTEGRAL_LIMIT,
+                                               DEFAULT_INTEGRAL_GAIN, INTEGRAL_LIMIT_PER_S)
 
 
 class _XY:
@@ -395,3 +396,69 @@ class TestIntegral:
     model = _good_model(lane_center_y=0.10, model_y=0.0)
     self._run(trim, model, 1000)         # 10 s at 100 Hz
     assert 1e-4 < abs(trim.integral) < 5e-4
+
+
+class TestIntegralGainSetting:
+  """The integral gain is a driver setting, and 0 is a real position.
+
+  Without it the lane-centering drive would introduce the centering, the integral and the
+  corrected tick all at once, with no way to bisect if the van behaves badly. 0 leaves the
+  trim purely proportional so the two halves can be driven on separate days.
+  """
+
+  V_EGO = 20.0
+
+  @staticmethod
+  def _run(trim, model, n, ki):
+    out = 0.0
+    for _ in range(n):
+      out = trim.update(0.0, model, TestIntegralGainSetting.V_EGO, True, 0.0, 1.0, True, False,
+                        integral_gain=ki)
+    return out
+
+  def test_zero_leaves_the_integral_at_zero(self):
+    trim = LaneCenterTrim()
+    self._run(trim, _good_model(lane_center_y=0.30, model_y=0.0), 2000, 0.0)
+    assert trim.integral == 0.0
+
+  def test_zero_still_leaves_the_proportional_part_working(self):
+    """Off must mean "no integral", not "no trim"."""
+    trim = LaneCenterTrim()
+    out = self._run(trim, _good_model(lane_center_y=0.30, model_y=0.0), 500, 0.0)
+    assert abs(out) > 1e-6
+
+  def test_a_larger_gain_builds_faster(self):
+    a, b = LaneCenterTrim(), LaneCenterTrim()
+    model = _good_model(lane_center_y=0.10, model_y=0.0)
+    self._run(a, model, 300, DEFAULT_INTEGRAL_GAIN)
+    self._run(b, model, 300, DEFAULT_INTEGRAL_GAIN * 3)
+    assert abs(b.integral) > abs(a.integral)
+
+  def test_the_gain_is_clamped_to_its_limit(self):
+    """A hand-typed value cannot buy more than the limit's worth of build rate."""
+    a, b = LaneCenterTrim(), LaneCenterTrim()
+    model = _good_model(lane_center_y=0.10, model_y=0.0)
+    self._run(a, model, 200, INTEGRAL_LIMIT_PER_S)
+    self._run(b, model, 200, INTEGRAL_LIMIT_PER_S * 100)
+    assert a.integral == pytest.approx(b.integral)
+
+  @pytest.mark.parametrize("bad", (float("nan"), float("inf")))
+  def test_a_non_finite_gain_does_not_reach_the_controller(self, bad):
+    trim = LaneCenterTrim()
+    out = self._run(trim, _good_model(lane_center_y=0.30, model_y=0.0), 50, bad)
+    assert out == 0.0
+    assert trim.integral == 0.0
+
+  def test_a_negative_gain_is_treated_as_off(self):
+    trim = LaneCenterTrim()
+    self._run(trim, _good_model(lane_center_y=0.30, model_y=0.0), 1000, -1.0)
+    assert trim.integral == 0.0
+
+  def test_turning_it_off_mid_drive_clears_what_was_built(self):
+    """So that switching it off on the road takes effect immediately, not after a decay."""
+    trim = LaneCenterTrim()
+    model = _good_model(lane_center_y=0.30, model_y=0.0)
+    self._run(trim, model, 600, DEFAULT_INTEGRAL_GAIN)
+    assert trim.integral != 0.0
+    self._run(trim, model, 1, 0.0)
+    assert trim.integral == 0.0

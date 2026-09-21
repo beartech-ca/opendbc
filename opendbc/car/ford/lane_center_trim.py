@@ -42,12 +42,14 @@ from opendbc.car.ford.values import TransitLaneCentering, unpack_transit_lka_fla
 # the caller, since Params can be edited by hand and these reach the controller.
 OFFSET_LIMIT_M = 0.5   # metres; negative is left, positive is right
 STRENGTH_LIMIT = 1.0   # fraction of the clipped raw correction actually applied
+INTEGRAL_LIMIT_PER_S = 0.20   # integral gain; 0 leaves the trim purely proportional
 
 # The shipped values, and what the settings screen offers to go back to. These are the
 # single source of truth: common/params_keys.h must declare the same two numbers as the
 # params' defaults, since that is what a device with no stored value reads.
 DEFAULT_OFFSET_M = 0.0     # centred; a deliberate bias is a tuning decision, not a default
 DEFAULT_STRENGTH = 0.25    # a quarter of the correction the limits already allow
+DEFAULT_INTEGRAL_GAIN = 0.03   # see _INTEGRAL notes below; 0 turns the integral off entirely
 
 # The camera height the model's spatial scale is implicitly trained at, which is also
 # calibrationd's HEIGHT_INIT. modeld never applies the calibrated height: the warp it feeds the
@@ -117,10 +119,11 @@ _CORRECTION_ROC_PER_S = 0.003
 # be. Integration is the only thing that recovers a signal underneath noise like that, because it
 # averages over time rather than reacting per frame.
 #
-# The gain is set so a steady 0.1 m error builds about 2.1e-4 1/m - the measured bias - over ten
-# seconds. That is deliberately slower than anything the driver will notice as a correction, and
-# far slower than the proportional path.
-_INTEGRAL_GAIN_PER_S = 0.03
+# The default gain is set so a steady 0.1 m error builds about 2.1e-4 1/m - the measured bias -
+# over ten seconds. That is deliberately slower than anything the driver will notice as a
+# correction, and far slower than the proportional path. It is driver-settable, and 0 is a real
+# setting: it leaves the trim purely proportional, which is how the two can be told apart on the
+# road rather than driven as one change.
 # Ceiling on what the integral alone may add (1/m). Twice the largest bias measured, which is
 # 0.15 m/s^2 of lateral acceleration at 60 km/h - and everything downstream, clip_curvature and
 # panda's own angle, rate and lateral-acceleration checks, still applies on top.
@@ -144,7 +147,8 @@ class LaneCenterTrim:
     self._integral = 0.0
 
   def update(self, kappa_cmd: float, model, v_ego: float, enabled: bool, offset: float,
-             gain: float, lat_active: bool, lane_change: bool, dt: float = DT_CTRL) -> float:
+             gain: float, lat_active: bool, lane_change: bool, dt: float = DT_CTRL,
+             integral_gain: float = DEFAULT_INTEGRAL_GAIN) -> float:
     """Returns ``kappa_cmd``, nudged toward (lane-blend target + ``offset``) when active.
 
     ``offset`` (m): positive shifts the target right, negative left (same sign convention as
@@ -152,6 +156,8 @@ class LaneCenterTrim:
     -- see module docstring.
     ``gain`` (0.0-1.0): user-tunable authority -- how much of the (already magnitude-clipped)
     raw correction is actually applied. 0 disables the trim's effect without disabling detection.
+    ``integral_gain`` (1/s): how fast the standing part builds. 0 leaves the trim purely
+    proportional and holds the integrator at zero, so the two halves can be driven separately.
 
     The applied correction is both exponentially smoothed (_SMOOTH_TAU_S) and rate-limited
     (_CORRECTION_ROC_PER_S) -- see the constants above -- so a lane-line-confidence transition
@@ -171,7 +177,8 @@ class LaneCenterTrim:
     if speed_factor <= 0.0:
       self.reset()
       return kappa_cmd
-    if not (np.isfinite(offset) and np.isfinite(gain)): #stops not a number from getting to steering command; validation of number
+    # stops not a number from getting to the steering command; validation of number
+    if not (np.isfinite(offset) and np.isfinite(gain) and np.isfinite(integral_gain)):
       self.reset()
       return kappa_cmd
 
@@ -188,8 +195,11 @@ class LaneCenterTrim:
     # Integrate only where the lane lines carry the error, and only while the proportional path
     # is not already at its ceiling -- conditional integration, so a saturated correction cannot
     # keep winding the integrator up behind it.
-    if scale >= _INTEGRAL_MIN_SCALE and abs(raw) < _MAX_RAW_CORRECTION:
-      self._integral = float(np.clip(self._integral + _INTEGRAL_GAIN_PER_S * clipped * dt,
+    ki = float(np.clip(integral_gain, 0.0, INTEGRAL_LIMIT_PER_S))
+    if ki <= 0.0:
+      self._integral = 0.0
+    elif scale >= _INTEGRAL_MIN_SCALE and abs(raw) < _MAX_RAW_CORRECTION:
+      self._integral = float(np.clip(self._integral + ki * clipped * dt,
                                      -_INTEGRAL_LIMIT, _INTEGRAL_LIMIT))
 
     # The integral is subject to the driver's authority knob and the speed ramp exactly as the
