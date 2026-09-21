@@ -34,6 +34,8 @@ Confidence uses BluePilot's formula and breakpoints unchanged.
 import numpy as np
 from numpy import interp
 
+from opendbc.car import DT_CTRL
+
 from opendbc.car.ford.values import TransitLaneCentering, unpack_transit_lka_flags
 
 # Ranges for the two driver-set values, shared with the settings widget and re-applied by
@@ -90,7 +92,7 @@ _MAX_RAW_CORRECTION = 0.004
 # First-order smoothing time constant (s) -- avoids abrupt jumps in the trim.
 _SMOOTH_TAU_S = 0.4
 
-# Rate-of-change limit on the applied correction (1/m per 20 Hz tick), independent of the
+# Rate-of-change limit on the applied correction (1/m per second), independent of the
 # smoothing filter above. The filter alone still has its *fastest* slew immediately after a
 # target jump -- its per-tick step is proportional to how far the target moved, so a large,
 # sudden confidence swing (e.g. crossing into/out of a too-wide merge lane, or lane lines
@@ -100,20 +102,49 @@ _SMOOTH_TAU_S = 0.4
 # curvature mode's LC_path_angle_ROC (lateral_curv_ext.py) rate-limit their outputs. At this
 # rate, crossing the full -_MAX_RAW_CORRECTION..+_MAX_RAW_CORRECTION span takes ~2.7s; a more
 # typical confidence-transition jump (a fraction of that) resolves proportionally faster.
-_CORRECTION_ROC_PER_TICK = 0.00015
+_CORRECTION_ROC_PER_S = 0.003
+
+
+# Integral term. The proportional part above cannot remove a standing bias: against a constant
+# curvature error it settles at offset = bias / loop_gain rather than at zero. This van has such
+# a bias - the end-to-end model leans right by 0.9-1.6 deg of wheel angle, measured by replaying
+# a segment through the model mirrored and solving the two runs - and the residual it leaves at
+# the shipped strength works out at 0.11-0.18 m.
+#
+# It also cannot be chased with a higher proportional gain. Binned over 8768 frames where the
+# driver was genuinely off the wheel, a request of 0.3-1.0 deg moves the wheel 0.66 deg/s against
+# a spread of 3.66 deg/s: the signal is a fifth of the noise at the size the correction needs to
+# be. Integration is the only thing that recovers a signal underneath noise like that, because it
+# averages over time rather than reacting per frame.
+#
+# The gain is set so a steady 0.1 m error builds about 2.1e-4 1/m - the measured bias - over ten
+# seconds. That is deliberately slower than anything the driver will notice as a correction, and
+# far slower than the proportional path.
+_INTEGRAL_GAIN_PER_S = 0.03
+# Ceiling on what the integral alone may add (1/m). Twice the largest bias measured, which is
+# 0.15 m/s^2 of lateral acceleration at 60 km/h - and everything downstream, clip_curvature and
+# panda's own angle, rate and lateral-acceleration checks, still applies on top.
+_INTEGRAL_LIMIT = 0.0006
+# Integrate only where the error means what the integrator assumes. Below this laneline weight
+# the blend falls back to the model's own path, which makes the error equal to the driver's
+# offset - a constant that never closes, and would wind the integrator up against the very bias
+# the driver asked for.
+_INTEGRAL_MIN_SCALE = 0.5
 
 
 class LaneCenterTrim:
   def __init__(self):
     self._correction = 0.0
+    self._integral = 0.0
     # Until calibration says otherwise, assume the model's own height, i.e. no width scaling.
     self._camera_height = MODEL_ASSUMED_HEIGHT_M
 
   def reset(self) -> None:
     self._correction = 0.0
+    self._integral = 0.0
 
   def update(self, kappa_cmd: float, model, v_ego: float, enabled: bool, offset: float,
-             gain: float, lat_active: bool, lane_change: bool) -> float:
+             gain: float, lat_active: bool, lane_change: bool, dt: float = DT_CTRL) -> float:
     """Returns ``kappa_cmd``, nudged toward (lane-blend target + ``offset``) when active.
 
     ``offset`` (m): positive shifts the target right, negative left (same sign convention as
@@ -123,9 +154,14 @@ class LaneCenterTrim:
     raw correction is actually applied. 0 disables the trim's effect without disabling detection.
 
     The applied correction is both exponentially smoothed (_SMOOTH_TAU_S) and rate-limited
-    (_CORRECTION_ROC_PER_TICK) -- see the constants above -- so a lane-line-confidence
-    transition (e.g. a merge lane too wide to be trusted, then narrowing back into range) eases
-    into its new target instead of snapping.
+    (_CORRECTION_ROC_PER_S) -- see the constants above -- so a lane-line-confidence transition
+    (e.g. a merge lane too wide to be trusted, then narrowing back into range) eases into its
+    new target instead of snapping.
+
+    ``dt`` is the caller's tick. Both of those limits are expressed per second and converted
+    here, because controlsd runs this at 100 Hz while the constants were ported from a 20 Hz
+    controller -- as written before, the smoothing was five times faster and the rate limit five
+    times looser than their own comments described.
     """
     if not enabled or not lat_active or lane_change or model is None:
       self.reset()
@@ -139,7 +175,7 @@ class LaneCenterTrim:
       self.reset()
       return kappa_cmd
 
-    valid, raw = self._raw_correction(model, v_ego, offset)
+    valid, raw, scale = self._raw_correction(model, v_ego, offset)
     if not valid:
       # Only true failure case now: model.position itself is unusable, so there's no baseline
       # to offset from at all (see _raw_correction). Lane-line-only failures fall back to the
@@ -147,14 +183,28 @@ class LaneCenterTrim:
       self.reset()
       return kappa_cmd
 
-    target = float(np.clip(raw, -_MAX_RAW_CORRECTION, _MAX_RAW_CORRECTION)) * float(np.clip(gain, 0.0, 1.0)) * speed_factor
-    alpha = 1.0 - np.exp(-0.05 / _SMOOTH_TAU_S)  # BluePilot lateral tick is 20 Hz (dt=0.05s)
+    clipped = float(np.clip(raw, -_MAX_RAW_CORRECTION, _MAX_RAW_CORRECTION))
+
+    # Integrate only where the lane lines carry the error, and only while the proportional path
+    # is not already at its ceiling -- conditional integration, so a saturated correction cannot
+    # keep winding the integrator up behind it.
+    if scale >= _INTEGRAL_MIN_SCALE and abs(raw) < _MAX_RAW_CORRECTION:
+      self._integral = float(np.clip(self._integral + _INTEGRAL_GAIN_PER_S * clipped * dt,
+                                     -_INTEGRAL_LIMIT, _INTEGRAL_LIMIT))
+
+    # The integral is subject to the driver's authority knob and the speed ramp exactly as the
+    # proportional part is: a strength of 0 has to mean the trim does nothing, and below the
+    # ramp there is no authority to apply.
+    authority = float(np.clip(gain, 0.0, 1.0)) * speed_factor
+    target = (clipped + self._integral) * authority
+
+    alpha = 1.0 - np.exp(-dt / _SMOOTH_TAU_S)
     filtered = float(alpha * target + (1.0 - alpha) * self._correction)
-    # Rate-of-change limit -- see _CORRECTION_ROC_PER_TICK. Bounds the correction's own per-tick
+    # Rate-of-change limit -- see _CORRECTION_ROC_PER_S. Bounds the correction's own per-tick
     # delta on top of the exponential filter above, so a lane-line-confidence transition can't
     # snap the trim toward its new target in one or two frames.
-    self._correction = float(np.clip(filtered, self._correction - _CORRECTION_ROC_PER_TICK,
-                                      self._correction + _CORRECTION_ROC_PER_TICK))
+    roc = _CORRECTION_ROC_PER_S * dt
+    self._correction = float(np.clip(filtered, self._correction - roc, self._correction + roc))
     return kappa_cmd + self._correction
 
   @property
@@ -162,19 +212,24 @@ class LaneCenterTrim:
     """Telemetry: last applied correction (1/m)."""
     return self._correction
 
-  def _raw_correction(self, model, v_ego: float, offset: float) -> tuple[bool, float]:
+  @property
+  def integral(self) -> float:
+    """Telemetry: the standing part of the correction (1/m), before authority is applied."""
+    return self._integral
+
+  def _raw_correction(self, model, v_ego: float, offset: float) -> tuple[bool, float, float]:
     try:
       pos_x = np.asarray(model.position.x, dtype=float)
       pos_y = np.asarray(model.position.y, dtype=float)
       if pos_x.size < 2 or pos_x.size != pos_y.size:
-        return False, 0.0
+        return False, 0.0, 0.0
       if not (np.isfinite(pos_x).all() and np.isfinite(pos_y).all() and np.all(np.diff(pos_x) > 0)):
-        return False, 0.0
+        return False, 0.0, 0.0
 
       lookahead = float(np.clip(v_ego, _LOOKAHEAD_MIN_M, _LOOKAHEAD_MAX_M))
       model_y = float(np.interp(lookahead, pos_x, pos_y))
     except (AttributeError, IndexError, TypeError, ValueError):
-      return False, 0.0
+      return False, 0.0, 0.0
 
     # Laneline contribution, blended in by confidence. scale=0 (model-position-only, i.e. just
     # the user's offset bias) whenever lines are missing, low-confidence, or structurally bad --
@@ -184,7 +239,7 @@ class LaneCenterTrim:
 
     error = (target_y + offset) - model_y
     raw = 2.0 * error / (lookahead ** 2)
-    return True, float(raw)
+    return True, float(raw), scale
 
   def set_camera_height(self, height_m: float) -> None:
     """Tell the trim what calibration believes the camera height is, in metres.

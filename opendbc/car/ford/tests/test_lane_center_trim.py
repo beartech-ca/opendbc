@@ -8,8 +8,10 @@ modelV2-shaped stub, so they run without openpilot.
 
 import pytest
 
+from opendbc.car import DT_CTRL
+
 from opendbc.car.ford.lane_center_trim import (LaneCenterTrim, MODEL_ASSUMED_HEIGHT_M,
-                                               _CORRECTION_ROC_PER_TICK)
+                                               _CORRECTION_ROC_PER_S, _INTEGRAL_LIMIT)
 
 
 class _XY:
@@ -246,7 +248,9 @@ class TestLaneCenterTrim:
 
     # The correction must not have snapped toward the new target -- bounded to roughly one
     # tick's worth of rate-of-change, regardless of how far the target actually moved.
-    assert (abs(after - before)) <= (_CORRECTION_ROC_PER_TICK + 1e-9)
+    # The limit is per second now, because controlsd ticks this at 100 Hz and the constant was
+    # ported from a 20 Hz controller; update() converts it with the caller's dt.
+    assert (abs(after - before)) <= (_CORRECTION_ROC_PER_S * DT_CTRL + 1e-9)
 
   def test_correction_eventually_converges_despite_rate_limit(self):
     # The rate limit paces the transition but must not prevent it from completing.
@@ -315,3 +319,79 @@ class TestCompressedWidth:
     trim.set_camera_height(1.51)
     trim.set_camera_height(bad)
     assert self._scale(trim, 3.7) == pytest.approx(self._scale(LaneCenterTrim(), 3.7))
+
+
+class TestIntegral:
+  """The integral term, which exists to remove a standing bias the proportional part cannot.
+
+  Against a constant curvature error a proportional position loop settles at
+  bias / loop_gain, not at zero. On this van the end-to-end model leans right by 0.9-1.6 deg
+  of wheel angle, which at the shipped strength leaves 0.11-0.18 m of offset. These hold the
+  integrator's behaviour, including the two ways it must refuse to accumulate.
+  """
+
+  V_EGO = 20.0
+
+  @staticmethod
+  def _run(trim, model, n, offset=0.0, gain=1.0):
+    out = 0.0
+    for _ in range(n):
+      out = trim.update(0.0, model, TestIntegral.V_EGO, True, offset, gain, True, False)
+    return out
+
+  def test_a_standing_error_is_eventually_removed_by_the_integral(self):
+    """With the same error held, the output must keep growing after the proportional part
+    has settled - that growth is the integral and is the whole point."""
+    trim = LaneCenterTrim()
+    model = _good_model(lane_center_y=0.30, model_y=0.0)
+    self._run(trim, model, 200)          # 2 s: proportional part settled
+    early = trim.correction
+    self._run(trim, model, 800)          # 8 s more
+    assert trim.integral != 0.0
+    assert abs(trim.correction) > abs(early)
+    assert (trim.integral > 0) == (trim.correction > 0)
+
+  def test_the_integral_is_bounded(self):
+    trim = LaneCenterTrim()
+    model = _good_model(lane_center_y=5.0, model_y=0.0)   # far beyond anything real
+    self._run(trim, model, 4000)                          # 40 s
+    assert abs(trim.integral) <= _INTEGRAL_LIMIT + 1e-12
+
+  def test_it_does_not_wind_up_without_trustworthy_lane_lines(self):
+    """With the lines weighted out the error is just the driver's offset, a constant that
+    never closes. Integrating it would cancel the bias the driver deliberately asked for."""
+    trim = LaneCenterTrim()
+    self._run(trim, _no_lanelines_model(model_y=0.0), 2000, offset=-0.3)
+    assert trim.integral == 0.0
+
+  def test_it_does_not_wind_up_behind_a_saturated_correction(self):
+    trim = LaneCenterTrim()
+    huge = _good_model(lane_center_y=50.0, model_y=0.0)   # raw well past _MAX_RAW_CORRECTION
+    self._run(trim, huge, 2000)
+    assert trim.integral == 0.0
+
+  def test_zero_error_leaves_it_at_zero(self):
+    trim = LaneCenterTrim()
+    self._run(trim, _good_model(lane_center_y=0.0, model_y=0.0), 1000)
+    assert trim.integral == pytest.approx(0.0, abs=1e-9)
+
+  def test_disengaging_clears_it(self):
+    trim = LaneCenterTrim()
+    self._run(trim, _good_model(lane_center_y=0.30, model_y=0.0), 600)
+    assert trim.integral != 0.0
+    trim.update(0.0, _good_model(), self.V_EGO, True, 0.0, 1.0, False, False)   # lat_active off
+    assert trim.integral == 0.0
+
+  def test_strength_zero_still_means_the_trim_does_nothing(self):
+    """The authority knob has to gate the integral too, or 0 would stop meaning off."""
+    trim = LaneCenterTrim()
+    out = self._run(trim, _good_model(lane_center_y=0.30, model_y=0.0), 1000, gain=0.0)
+    assert out == pytest.approx(0.0, abs=1e-12)
+
+  def test_it_builds_at_about_the_designed_rate(self):
+    """A 0.1 m error should reach roughly the measured bias (2.1e-4 1/m) in about ten seconds.
+    Checked as an order of magnitude, not a fit: the point is that it is slow."""
+    trim = LaneCenterTrim()
+    model = _good_model(lane_center_y=0.10, model_y=0.0)
+    self._run(trim, model, 1000)         # 10 s at 100 Hz
+    assert 1e-4 < abs(trim.integral) < 5e-4
