@@ -139,12 +139,18 @@ class LaneCenterTrim:
   def __init__(self):
     self._correction = 0.0
     self._integral = 0.0
+    # What the last update did, for the log. The trim sits between the model's curvature and
+    # the one that reaches the controller, and neither end of that is enough to reconstruct
+    # it: clip_curvature and the roll compensation land in the same difference. Without this
+    # an A/B of the settings cannot be told apart afterwards.
+    self.debug = (0.0, 0.0, 0.0, 0.0)   # raw, laneline scale, integral, applied correction
     # Until calibration says otherwise, assume the model's own height, i.e. no width scaling.
     self._camera_height = MODEL_ASSUMED_HEIGHT_M
 
   def reset(self) -> None:
     self._correction = 0.0
     self._integral = 0.0
+    self.debug = (0.0, 0.0, 0.0, 0.0)
 
   def update(self, kappa_cmd: float, model, v_ego: float, enabled: bool, offset: float,
              gain: float, lat_active: bool, lane_change: bool, dt: float = DT_CTRL,
@@ -215,6 +221,7 @@ class LaneCenterTrim:
     # snap the trim toward its new target in one or two frames.
     roc = _CORRECTION_ROC_PER_S * dt
     self._correction = float(np.clip(filtered, self._correction - roc, self._correction + roc))
+    self.debug = (raw, scale, self._integral, self._correction)
     return kappa_cmd + self._correction
 
   @property
