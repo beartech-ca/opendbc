@@ -21,7 +21,11 @@ class CarControllerParams:
   ACC_UI_STEP = 20      # ACCDATA_3, 5Hz
   BUTTONS_STEP = 5      # Steering_Data_FD1, 10Hz, but send twice as fast
 
-  STEER_DRIVER_ALLOWANCE = 1.0  # Driver intervention threshold, Nm
+  # Driver intervention threshold, Nm. Upstream's 1.0 matches the stock PSCM; this van runs
+  # modified PSCM firmware whose own override threshold is 1.5, so leaving this at 1.0 would
+  # have openpilot call the driver "holding" while the PSCM is still steering.
+  # Only reached through steeringPressed - panda has no driver-torque limit on Ford.
+  STEER_DRIVER_ALLOWANCE = 1.5
 
   ANGLE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
     0.02,  # Max curvature for steering command, m^-1
