@@ -182,6 +182,55 @@ class TestChryslerCuswSafety(common.CarSafetyTest, common.MotorTorqueSteeringSaf
     self.assertFalse(self._tx(self._torque_cmd_msg(46, steer_req=1)))
     self.assertTrue(self._tx(self._torque_cmd_msg(0, steer_req=0)))
 
+  def test_ramp_down_full_rate_completes(self):
+    """A ramp from max torque at MAX_RATE_DOWN every 10 ms finishes within the deadline"""
+    t = 0
+    self.safety.set_timer(t)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_torque(self.MAX_TORQUE)
+    self.assertTrue(self._tx(self._torque_cmd_msg(self.MAX_TORQUE)))
+
+    self.safety.set_controls_allowed(False)
+    torque = self.MAX_TORQUE
+    while torque > 0:
+      torque = max(torque - self.MAX_RATE_DOWN, 0)
+      t += 10000
+      self.safety.set_timer(t)
+      self.assertTrue(self._tx(self._torque_cmd_msg(torque, steer_req=int(torque != 0))))
+    self.assertEqual(self.safety.get_chrysler_cusw_torque_last(), 0)
+
+  def test_ramp_down_deadline(self):
+    """Non-zero torque is blocked once the ramp-down has lasted longer than 1 s"""
+    self.safety.set_timer(0)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_torque(100)
+    self.assertTrue(self._tx(self._torque_cmd_msg(100)))
+
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._tx(self._torque_cmd_msg(99)))
+    self.safety.set_timer(1000000)
+    self.assertTrue(self._tx(self._torque_cmd_msg(98)))
+    self.safety.set_timer(1000001)
+    self.assertFalse(self._tx(self._torque_cmd_msg(97)))
+    self.assertEqual(self.safety.get_chrysler_cusw_torque_last(), 0)
+    self.assertTrue(self._tx(self._torque_cmd_msg(0, steer_req=0)))
+
+  def test_ramp_down_deadline_resets_on_reengage(self):
+    """Each disengage gets its own ramp-down window"""
+    self.safety.set_timer(0)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_torque(100)
+    self.assertTrue(self._tx(self._torque_cmd_msg(100)))
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._tx(self._torque_cmd_msg(99)))
+
+    self.safety.set_timer(900000)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_torque(99)
+    self.assertTrue(self._tx(self._torque_cmd_msg(99)))
+    self.safety.set_controls_allowed(False)
+    self.safety.set_timer(1800000)
+    self.assertTrue(self._tx(self._torque_cmd_msg(98)))
 
 if __name__ == "__main__":
   unittest.main()

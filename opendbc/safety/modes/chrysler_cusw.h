@@ -4,10 +4,17 @@
 // When controls are disallowed, CUSW must ramp torque to zero at max_rate_down
 // before clearing the LKAS active bit, to avoid EPS faults.
 static int chrysler_cusw_torque_last = 0;
+// The ramp-down is time bounded: 250 -> 0 at 4/frame takes 63 frames (0.63 s at 100 Hz).
+// Without a deadline, a slow sender could keep non-zero torque applied indefinitely.
+#define CHRYSLER_CUSW_MAX_RAMP_DOWN_US 1000000U
+static bool chrysler_cusw_ramp_active = false;
+static uint32_t chrysler_cusw_ramp_start_ts = 0;
 
 static safety_config chrysler_cusw_init(uint16_t param) {
   SAFETY_UNUSED(param);
   chrysler_cusw_torque_last = 0;
+  chrysler_cusw_ramp_active = false;
+  chrysler_cusw_ramp_start_ts = 0;
 
   static const CanMsg CHRYSLER_CUSW_TX_MSGS[] = {
     {0x1F6U, 0, 4, .check_relay = true},
@@ -76,6 +83,7 @@ static bool chrysler_cusw_tx_hook(const CANPacket_t *msg) {
     const bool steer_req = GET_BIT(msg, 12U);
 
     if (controls_allowed) {
+      chrysler_cusw_ramp_active = false;
       // Normal operation: use standard torque checks
       if (steer_torque_cmd_checks(desired_torque, steer_req, CHRYSLER_CUSW_STEERING_LIMITS)) {
         tx = false;
@@ -87,6 +95,13 @@ static bool chrysler_cusw_tx_hook(const CANPacket_t *msg) {
       // Ramp-down: torque must move toward zero at max_rate_down per frame
       bool violation = false;
       const int max_delta = CHRYSLER_CUSW_STEERING_LIMITS.max_rate_down;
+
+      const uint32_t ts = microsecond_timer_get();
+      if (!chrysler_cusw_ramp_active) {
+        chrysler_cusw_ramp_active = true;
+        chrysler_cusw_ramp_start_ts = ts;
+      }
+      violation |= (safety_get_ts_elapsed(ts, chrysler_cusw_ramp_start_ts) > CHRYSLER_CUSW_MAX_RAMP_DOWN_US);
 
       if (chrysler_cusw_torque_last > 0) {
         violation |= (desired_torque >= chrysler_cusw_torque_last);  // must decrease
@@ -110,6 +125,9 @@ static bool chrysler_cusw_tx_hook(const CANPacket_t *msg) {
         tx = false;
       } else {
         chrysler_cusw_torque_last = desired_torque;
+      }
+      if (chrysler_cusw_torque_last == 0) {
+        chrysler_cusw_ramp_active = false;
       }
     } else {
       // Ramp-down complete or never started: torque must be zero
